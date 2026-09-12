@@ -3,7 +3,7 @@ use chrono::Utc;
 use rand::RngCore;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -805,7 +805,10 @@ mod tests {
             request.get("grant_type").map(String::as_str),
             Some("refresh_token")
         );
-        assert_eq!(request.get("client_id").map(String::as_str), Some(CLIENT_ID));
+        assert_eq!(
+            request.get("client_id").map(String::as_str),
+            Some(CLIENT_ID)
+        );
         assert_eq!(
             request.get("refresh_token").map(String::as_str),
             Some("old-refresh")
