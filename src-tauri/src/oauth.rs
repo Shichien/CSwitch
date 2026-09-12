@@ -364,6 +364,7 @@ fn normalize_proxy_url(value: &str) -> Option<String> {
     matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h").then_some(url)
 }
 
+#[cfg(any(windows, test))]
 fn parse_windows_proxy_server(server: &str) -> Option<String> {
     let server = server.trim();
     if server.is_empty() {
