@@ -30,7 +30,7 @@ requires_openai_auth = true
 ```
 
 - 可选保持官方 ChatGPT 登录：切换第三方时保留 `auth.json`，并把 API Key 写入 `[model_providers.custom]` 的 `experimental_bearer_token`。默认关闭。
-- 将 `sessions`、`archived_sessions` 和 `state_5.sqlite` 中的任务提供方同步为当前 Codex 提供方，使已有任务在切换后继续显示。
+- 仅在官方登录和第三方之间切换时，才把 `sessions`、`archived_sessions` 和 `state_5.sqlite` 中的任务提供方改成当前 Codex 提供方。第三方之间切换或启用本地路由时跳过，避免全量改写。
 - 对 Chat Completions 和 Anthropic Messages 供应商启动本地协议转换，并向 Codex 提供 Responses 接口。
 - 本地网关会丢弃没有 `encrypted_content` 的 reasoning，并去掉非 `rs_` 前缀的 ID，避免第三方接口返回非法 reasoning ID。
 - 切换供应商、官方登录和保存配置时显示分步进度。

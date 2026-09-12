@@ -339,7 +339,12 @@ where
     C: FnOnce() -> Result<bool, Box<dyn Error>>,
 {
     const TOTAL: u32 = 7;
-    progress.stage(1, TOTAL, "准备切换", "正在读取供应商配置并恢复未完成的操作。");
+    progress.stage(
+        1,
+        TOTAL,
+        "准备切换",
+        "正在读取供应商配置并恢复未完成的操作。",
+    );
     ensure_provider_migration(codex_home)?;
     let profiles = ProfileStore::new(codex_home);
     let mut target = profiles.load_provider(provider_id)?;
@@ -490,12 +495,7 @@ where
             saved_official_auth.as_deref(),
             &target.auth,
         );
-        progress.stage(
-            6,
-            TOTAL,
-            "同步会话历史",
-            "正在更新 Codex 会话记录，文件较多时会多等一会儿。",
-        );
+        report_history_stage(progress, 6, TOTAL, config_selects_custom(original_bytes)?);
         let report = activate_custom(
             codex_home,
             original.as_deref(),
@@ -745,12 +745,7 @@ pub(crate) fn switch_to_official_with_progress(
                 "正在恢复官方 config.toml 和 ChatGPT 登录态。",
             );
             profiles.save_official(&official_config, &official_auth)?;
-            progress.stage(
-                6,
-                TOTAL,
-                "同步会话历史",
-                "正在更新 Codex 会话记录，文件较多时会多等一会儿。",
-            );
+            report_history_stage(progress, 6, TOTAL, is_official_config(original_text)?);
             let report = activate_official(
                 codex_home,
                 original.as_deref(),
@@ -827,6 +822,29 @@ fn capture_official_profile(
         return Ok(());
     }
     profiles.save_official(config, &auth)
+}
+
+fn report_history_stage(
+    progress: &ProgressReporter,
+    current: u32,
+    total: u32,
+    already_aligned: bool,
+) {
+    if already_aligned {
+        progress.stage(
+            current,
+            total,
+            "跳过会话同步",
+            "当前已是同一 Codex 提供方，不必改写历史对话。",
+        );
+    } else {
+        progress.stage(
+            current,
+            total,
+            "同步会话历史",
+            "正在把会话记录改到当前提供方，文件较多时会多等一会儿。",
+        );
+    }
 }
 
 fn activate_custom(

@@ -225,8 +225,27 @@ where
             return Err(format!("读取 {} 失败：{error}", auth_path.display()).into());
         }
     };
-    let changes = collect_rollout_changes(codex_home, target_provider)?;
-    let state_db = resolve_state_db(codex_home)?;
+    let skip_history = live_provider_id(original_config).as_deref() == Some(target_provider);
+    let config_unchanged = original_config.is_some_and(|content| content == updated_config);
+    let auth_unchanged = match auth_update {
+        AuthUpdate::Keep => true,
+        AuthUpdate::Replace(auth) => original_auth.as_deref() == Some(auth),
+    };
+    if skip_history && config_unchanged && auth_unchanged {
+        before_config_write()?;
+        return Ok(unchanged_sync_report());
+    }
+
+    let changes = if skip_history {
+        Vec::new()
+    } else {
+        collect_rollout_changes(codex_home, target_provider)?
+    };
+    let state_db = if skip_history {
+        None
+    } else {
+        resolve_state_db(codex_home)?
+    };
     if let Some(path) = state_db.as_deref() {
         assert_sqlite_writable(path)?;
     }
@@ -234,13 +253,21 @@ where
         Some(path) => read_sqlite_provider_counts(path)?,
         None => BTreeMap::new(),
     };
+    let sqlite_needs_update = sqlite_counts
+        .iter()
+        .any(|(provider, count)| provider.as_str() != target_provider && *count > 0);
+    let sqlite_backup = if sqlite_needs_update {
+        state_db.clone()
+    } else {
+        None
+    };
 
     let providers_detected = merge_provider_counts(&changes, &sqlite_counts);
     let backup_dir = create_backup(
         codex_home,
         original_config,
         original_auth.as_deref(),
-        state_db.as_deref(),
+        sqlite_backup.as_deref(),
         &changes,
         &providers_detected,
         target_provider,
@@ -266,35 +293,38 @@ where
             )?;
         }
 
-        let sqlite_rows_updated = match state_db.as_deref() {
-            Some(path) => {
-                sqlite_mutated = sqlite_counts
-                    .iter()
-                    .any(|(provider, count)| provider != target_provider && *count > 0);
-                update_sqlite_provider(path, target_provider)?
+        let sqlite_rows_updated = if sqlite_needs_update {
+            match state_db.as_deref() {
+                Some(path) => {
+                    sqlite_mutated = true;
+                    update_sqlite_provider(path, target_provider)?
+                }
+                None => 0,
             }
-            None => 0,
+        } else {
+            0
         };
 
         before_config_write()?;
-        config_written = true;
-        atomic_write(&config_path, updated_config)?;
-        if fs::read(&config_path)? != updated_config {
-            return Err("config.toml 写入后的字节验证失败".into());
+        if !config_unchanged {
+            config_written = true;
+            atomic_write(&config_path, updated_config)?;
+            if fs::read(&config_path)? != updated_config {
+                return Err("config.toml 写入后的字节验证失败".into());
+            }
         }
 
-        verify_rollouts(codex_home, target_provider)?;
-        if let Some(path) = state_db.as_deref() {
+        verify_applied_rollouts(&changes)?;
+        if sqlite_needs_update && let Some(path) = state_db.as_deref() {
             verify_sqlite_provider(path, target_provider)?;
         }
 
         match auth_update {
             AuthUpdate::Keep => {}
+            AuthUpdate::Replace(_) if auth_unchanged => {}
             AuthUpdate::Replace(auth) => {
-                auth_mutated = original_auth.as_deref() != Some(auth);
-                if auth_mutated {
-                    atomic_write(&auth_path, auth)?;
-                }
+                auth_mutated = true;
+                atomic_write(&auth_path, auth)?;
                 if fs::read(&auth_path)? != auth {
                     return Err("auth.json 写入后的字节验证失败".into());
                 }
@@ -353,6 +383,32 @@ where
             finish_failed_transaction(codex_home, error.to_string(), rollback_errors, &backup_dir)
         }
     }
+}
+
+fn unchanged_sync_report() -> ProviderSyncReport {
+    ProviderSyncReport {
+        rollout_files_updated: 0,
+        sqlite_rows_updated: 0,
+        providers_detected: Vec::new(),
+        backup_path: String::new(),
+    }
+}
+
+fn live_provider_id(config: Option<&[u8]>) -> Option<String> {
+    let bytes = config.unwrap_or(b"");
+    if bytes.is_empty() {
+        return Some("openai".to_string());
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let document: toml_edit::DocumentMut = text.parse().ok()?;
+    Some(
+        document
+            .get("model_provider")
+            .and_then(toml_edit::Item::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("openai")
+            .to_string(),
+    )
 }
 
 fn finish_failed_transaction<T>(
@@ -1117,14 +1173,12 @@ fn restore_optional_file(path: &Path, content: Option<&[u8]>) -> Result<(), Box<
     }
 }
 
-fn verify_rollouts(codex_home: &Path, target_provider: &str) -> Result<(), Box<dyn Error>> {
-    let remaining = collect_rollout_changes(codex_home, target_provider)?;
-    if !remaining.is_empty() {
-        return Err(format!(
-            "rollout 验证失败，仍有 {} 个文件不属于 {target_provider}",
-            remaining.len()
-        )
-        .into());
+fn verify_applied_rollouts(changes: &[RolloutChange]) -> Result<(), Box<dyn Error>> {
+    for change in changes {
+        let (first_line, separator) = read_first_line(&change.path)?;
+        if first_line != change.updated_first_line || separator != change.separator {
+            return Err(format!("rollout 验证失败：{}", change.path.display()).into());
+        }
     }
     Ok(())
 }
@@ -1337,6 +1391,75 @@ mod tests {
                 .join("sqlite/state_5.sqlite")
                 .is_file()
         );
+        assert!(!codex_home.join(TRANSACTION_FILE).exists());
+    }
+
+    #[test]
+    fn skips_history_when_live_provider_already_matches() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let rollout = codex_home.join("sessions/rollout-already-custom.jsonl");
+        create_rollout(
+            &rollout,
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"leave me"}}"#,
+        );
+        let original_rollout = fs::read(&rollout).expect("read rollout");
+        let state_db = codex_home.join("sqlite/state_5.sqlite");
+        create_state_db(&state_db, &[Some("openai")]);
+        let original = b"model_provider = \"custom\"\nmodel = \"keep\"\n";
+        let updated = b"model_provider = \"custom\"\nmodel = \"next\"\n";
+        fs::write(codex_home.join("config.toml"), original).expect("write config");
+
+        let report =
+            apply_provider_config(codex_home, Some(original), updated, "custom").expect("sync");
+
+        assert_eq!(report.rollout_files_updated, 0);
+        assert_eq!(report.sqlite_rows_updated, 0);
+        assert_eq!(
+            fs::read(&rollout).expect("read rollout after skip"),
+            original_rollout
+        );
+        let remaining: i64 = Connection::open(&state_db)
+            .expect("open db")
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE model_provider = 'openai'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count openai threads");
+        assert_eq!(remaining, 1);
+        assert_eq!(
+            fs::read(codex_home.join("config.toml")).expect("read config"),
+            updated
+        );
+        assert!(Path::new(&report.backup_path).join("config.toml").is_file());
+        assert!(
+            !Path::new(&report.backup_path)
+                .join("sqlite/state_5.sqlite")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn skips_backup_when_config_auth_and_history_are_unchanged() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let original = b"model_provider = \"custom\"\n";
+        fs::write(codex_home.join("config.toml"), original).expect("write config");
+        create_rollout(
+            &codex_home.join("sessions/rollout-skip.jsonl"),
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"ignored"}}"#,
+        );
+
+        let report =
+            apply_provider_config(codex_home, Some(original), original, "custom").expect("noop");
+
+        assert_eq!(report.rollout_files_updated, 0);
+        assert_eq!(report.sqlite_rows_updated, 0);
+        assert!(report.backup_path.is_empty());
+        assert!(!codex_home.join(BACKUP_DIR).exists());
         assert!(!codex_home.join(TRANSACTION_FILE).exists());
     }
 

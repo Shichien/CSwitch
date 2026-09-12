@@ -24,19 +24,11 @@ pub struct OfficialProfile {
     pub config: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     #[serde(default)]
     pub keep_official_auth: bool,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            keep_official_auth: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

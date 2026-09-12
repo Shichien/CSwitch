@@ -37,6 +37,11 @@ function errorText(error: unknown): string {
   return String(error);
 }
 
+function switchedNotice(name: string, synced: number): string {
+  if (synced > 0) return `已切换到 ${name}，已同步 ${synced} 个任务`;
+  return `已切换到 ${name}`;
+}
+
 function App() {
   const [state, setState] = useState<ProviderState>(EMPTY_STATE);
   const [busy, setBusy] = useState<BusyAction>("load");
@@ -133,7 +138,7 @@ function App() {
     try {
       const report = await cswitchApi.activateProvider(provider.id);
       await refresh();
-      showNotice("success", `已切换到 ${provider.name}，已同步 ${report.rolloutFilesUpdated} 个任务`);
+      showNotice("success", switchedNotice(provider.name, report.rolloutFilesUpdated));
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
@@ -195,7 +200,7 @@ function App() {
       const report = await cswitchApi.activateProvider(provider.id);
       setRoutingProvider(null);
       await refresh();
-      showNotice("success", `已切换到 ${provider.name}，已同步 ${report.rolloutFilesUpdated} 个任务`);
+      showNotice("success", switchedNotice(provider.name, report.rolloutFilesUpdated));
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
@@ -234,7 +239,7 @@ function App() {
     try {
       const report = await cswitchApi.startOfficialLogin();
       await refresh();
-      showNotice("success", `已切换到官方登录，已同步 ${report.rolloutFilesUpdated} 个任务`);
+      showNotice("success", switchedNotice("官方登录", report.rolloutFilesUpdated));
     } catch (error) {
       const message = errorText(error);
       if (message !== "官方登录已取消") showNotice("error", message);

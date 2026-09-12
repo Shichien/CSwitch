@@ -94,11 +94,7 @@ async fn save_provider(
     api_url: String,
     api_key: String,
 ) -> Result<SavedProvider, String> {
-    let progress = reporter(
-        &app,
-        "save",
-        "保存供应商",
-    );
+    let progress = reporter(&app, "save", "保存供应商");
     progress.stage(
         1,
         2,

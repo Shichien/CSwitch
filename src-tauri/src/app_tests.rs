@@ -244,8 +244,9 @@ fn switching_providers_updates_auth_catalog_model_and_active_marker() {
         &["model-two"],
     );
 
-    activate_provider_inner_with_close(codex_home, &first.id, || Ok(false))
+    let first_report = activate_provider_inner_with_close(codex_home, &first.id, || Ok(false))
         .expect("activate first");
+    assert_eq!(first_report.rollout_files_updated, 1);
     let first_config = fs::read_to_string(codex_home.join("config.toml")).expect("first config");
     let first_document = parse_config(&first_config).expect("parse first config");
     assert_eq!(first_document["model"].as_str(), Some("official-model"));
@@ -258,8 +259,9 @@ fn switching_providers_updates_auth_catalog_model_and_active_marker() {
         Some("first-key")
     );
 
-    activate_provider_inner_with_close(codex_home, &second.id, || Ok(false))
+    let second_report = activate_provider_inner_with_close(codex_home, &second.id, || Ok(false))
         .expect("activate second");
+    assert_eq!(second_report.rollout_files_updated, 0);
     let state = list_provider_state(codex_home).expect("provider state");
     assert_eq!(
         state.active_provider_id.as_deref(),
@@ -623,7 +625,10 @@ fn keep_official_auth_preserves_chatgpt_tokens_and_writes_bearer_token() {
         Some("供应商")
     );
     let state = list_provider_state(codex_home).expect("provider state");
-    assert_eq!(state.active_provider_id.as_deref(), Some(provider.id.as_str()));
+    assert_eq!(
+        state.active_provider_id.as_deref(),
+        Some(provider.id.as_str())
+    );
     assert!(!state.official_active);
     assert!(state.keep_official_auth);
     assert!(state.official_auth_available);
@@ -659,7 +664,11 @@ fn disabling_keep_official_auth_writes_the_api_key_into_auth() {
     let directory = tempdir().expect("tempdir");
     let codex_home = directory.path();
     let official_auth = official_auth(chrono::Utc::now().timestamp() + 3600, "refresh");
-    fs::write(codex_home.join("config.toml"), b"model = \"official-model\"\n").expect("write config");
+    fs::write(
+        codex_home.join("config.toml"),
+        b"model = \"official-model\"\n",
+    )
+    .expect("write config");
     fs::write(codex_home.join("auth.json"), &official_auth).expect("write auth");
     let provider = save_fixture_provider(
         codex_home,
@@ -689,5 +698,8 @@ fn disabling_keep_official_auth_writes_the_api_key_into_auth() {
     );
     let state = list_provider_state(codex_home).expect("provider state");
     assert!(!state.keep_official_auth);
-    assert_eq!(state.active_provider_id.as_deref(), Some(provider.id.as_str()));
+    assert_eq!(
+        state.active_provider_id.as_deref(),
+        Some(provider.id.as_str())
+    );
 }
