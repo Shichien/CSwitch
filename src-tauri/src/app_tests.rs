@@ -1,5 +1,6 @@
 use super::*;
 use crate::desktop::operation_error;
+use crate::profiles::AppSettings;
 use base64::Engine;
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -43,7 +44,8 @@ fn save_fixture_provider(
         .expect("read config")
         .unwrap_or_default();
     let source = std::str::from_utf8(&source).expect("utf8 config");
-    let config = build_provider_config(source, name, api_url).expect("build provider config");
+    let config =
+        build_provider_config(source, name, api_url, api_key).expect("build provider config");
     profiles
         .save_provider(
             None,
@@ -99,8 +101,13 @@ name = "Old"
 base_url = "https://old.example"
 request_max_retries = 9
 "#;
-    let updated = build_provider_config(original, "新供应商", "https://api.example.com")
-        .expect("build config");
+    let updated = build_provider_config(
+        original,
+        "新供应商",
+        "https://api.example.com",
+        "fixture-key",
+    )
+    .expect("build config");
     let document = parse_config(&updated).expect("parse config");
     assert_eq!(document["model"].as_str(), Some("official-model"));
     assert_eq!(document["model_reasoning_effort"].as_str(), Some("xhigh"));
@@ -137,6 +144,10 @@ request_max_retries = 9
             .get("request_max_retries")
             .and_then(Item::as_integer),
         Some(9)
+    );
+    assert_eq!(
+        document["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("fixture-key")
     );
 }
 
@@ -342,6 +353,7 @@ fn migrates_the_legacy_custom_profile_once() {
         "model = \"legacy-model\"\n",
         "旧供应商",
         "https://legacy.example",
+        "legacy-key",
     )
     .expect("legacy config");
     profiles
@@ -570,4 +582,112 @@ fn official_selection_refreshes_only_an_expiring_candidate() {
     .expect("official auth");
     assert_eq!(selected, refreshed);
     assert_eq!(refresh_calls, 1);
+}
+
+#[test]
+fn keep_official_auth_preserves_chatgpt_tokens_and_writes_bearer_token() {
+    let directory = tempdir().expect("tempdir");
+    let codex_home = directory.path();
+    let official_config = b"model = \"official-model\"\napproval_policy = \"never\"\n";
+    let official_auth = official_auth(chrono::Utc::now().timestamp() + 3600, "refresh");
+    fs::write(codex_home.join("config.toml"), official_config).expect("write config");
+    fs::write(codex_home.join("auth.json"), &official_auth).expect("write auth");
+    let provider = save_fixture_provider(
+        codex_home,
+        "供应商",
+        "https://provider.example",
+        "provider-key",
+        &["provider-model"],
+    );
+    ProfileStore::new(codex_home)
+        .save_settings(&AppSettings {
+            keep_official_auth: true,
+        })
+        .expect("enable keep official auth");
+
+    activate_provider_inner_with_close(codex_home, &provider.id, || Ok(false))
+        .expect("activate with keep official auth");
+
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        official_auth
+    );
+    let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+    let document = parse_config(&config).expect("parse config");
+    assert_eq!(
+        document["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("provider-key")
+    );
+    assert_eq!(
+        document["model_providers"]["custom"]["name"].as_str(),
+        Some("供应商")
+    );
+    let state = list_provider_state(codex_home).expect("provider state");
+    assert_eq!(state.active_provider_id.as_deref(), Some(provider.id.as_str()));
+    assert!(!state.official_active);
+    assert!(state.keep_official_auth);
+    assert!(state.official_auth_available);
+
+    let second = save_fixture_provider(
+        codex_home,
+        "供应商二",
+        "https://two.example",
+        "second-key",
+        &["model-two"],
+    );
+    activate_provider_inner_with_close(codex_home, &second.id, || Ok(false))
+        .expect("switch to second provider");
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        official_auth
+    );
+    assert_eq!(
+        api_key_from_auth(
+            &ProfileStore::new(codex_home)
+                .load_provider(&provider.id)
+                .expect("first profile")
+                .auth
+        )
+        .unwrap()
+        .as_deref(),
+        Some("provider-key")
+    );
+}
+
+#[test]
+fn disabling_keep_official_auth_writes_the_api_key_into_auth() {
+    let directory = tempdir().expect("tempdir");
+    let codex_home = directory.path();
+    let official_auth = official_auth(chrono::Utc::now().timestamp() + 3600, "refresh");
+    fs::write(codex_home.join("config.toml"), b"model = \"official-model\"\n").expect("write config");
+    fs::write(codex_home.join("auth.json"), &official_auth).expect("write auth");
+    let provider = save_fixture_provider(
+        codex_home,
+        "供应商",
+        "https://provider.example",
+        "provider-key",
+        &["provider-model"],
+    );
+    ProfileStore::new(codex_home)
+        .save_settings(&AppSettings {
+            keep_official_auth: true,
+        })
+        .expect("enable keep official auth");
+    activate_provider_inner_with_close(codex_home, &provider.id, || Ok(false))
+        .expect("activate while keeping official auth");
+    assert_eq!(
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        official_auth
+    );
+
+    set_keep_official_auth_inner(codex_home, false).expect("disable keep official auth");
+    assert_eq!(
+        api_key_from_auth(&fs::read(codex_home.join("auth.json")).unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("provider-key")
+    );
+    let state = list_provider_state(codex_home).expect("provider state");
+    assert!(!state.keep_official_auth);
+    assert_eq!(state.active_provider_id.as_deref(), Some(provider.id.as_str()));
 }

@@ -13,6 +13,7 @@ import { ProviderCard } from "./components/ProviderCard";
 import { ProviderDialog } from "./components/ProviderDialog";
 import { cswitchApi } from "./lib/api";
 import type {
+  OperationProgress,
   ProviderDraft,
   ProviderState,
   ProviderSummary,
@@ -23,10 +24,12 @@ const EMPTY_STATE: ProviderState = {
   providers: [],
   activeProviderId: null,
   officialActive: false,
+  keepOfficialAuth: false,
+  officialAuthAvailable: false,
 };
 
 type Notice = { kind: "success" | "error"; text: string } | null;
-type BusyAction = "load" | "official" | "save" | "route" | "delete" | string | null;
+type BusyAction = "load" | "official" | "save" | "route" | "delete" | "keep-auth" | string | null;
 
 function errorText(error: unknown): string {
   if (typeof error === "string") return error;
@@ -42,6 +45,7 @@ function App() {
   const [editingProvider, setEditingProvider] = useState<ProviderSummary | null>(null);
   const [routingProvider, setRoutingProvider] = useState<ProviderSummary | null>(null);
   const [deletingProvider, setDeletingProvider] = useState<ProviderSummary | null>(null);
+  const [progress, setProgress] = useState<OperationProgress | null>(null);
   const noticeTimer = useRef<number | null>(null);
 
   const showNotice = useCallback((kind: "success" | "error", text: string) => {
@@ -73,6 +77,34 @@ function App() {
     };
   }, [showNotice]);
 
+  useEffect(() => {
+    let unlistenProgress: (() => void) | undefined;
+    let unlistenChanged: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+    void cswitchApi.onProgress((next) => {
+      setProgress(next.done ? null : next);
+      if (next.done) setBusy(null);
+      else if (next.operation) setBusy(next.operation);
+    }).then((fn) => {
+      unlistenProgress = fn;
+    });
+    void cswitchApi.onProvidersChanged(() => {
+      void refresh();
+    }).then((fn) => {
+      unlistenChanged = fn;
+    });
+    void cswitchApi.onOperationError((message) => {
+      showNotice("error", message);
+    }).then((fn) => {
+      unlistenError = fn;
+    });
+    return () => {
+      unlistenProgress?.();
+      unlistenChanged?.();
+      unlistenError?.();
+    };
+  }, [refresh, showNotice]);
+
   const openAdd = () => {
     setEditingProvider(null);
     setProviderDialogOpen(true);
@@ -89,6 +121,15 @@ function App() {
       return;
     }
     setBusy(provider.id);
+    setProgress({
+      operation: "activate",
+      title: `切换到 ${provider.name}`,
+      stage: "准备切换",
+      detail: "正在获取操作锁并恢复未完成的操作。",
+      current: 0,
+      total: 7,
+      done: false,
+    });
     try {
       const report = await cswitchApi.activateProvider(provider.id);
       await refresh();
@@ -96,6 +137,7 @@ function App() {
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      setProgress(null);
       setBusy(null);
     }
   };
@@ -103,6 +145,15 @@ function App() {
   const save = async (draft: ProviderDraft) => {
     const wasActive = Boolean(editingProvider?.active);
     setBusy("save");
+    setProgress({
+      operation: "save",
+      title: "保存供应商",
+      stage: "验证供应商",
+      detail: "正在探测上游协议并拉取模型目录，可能需要几秒。",
+      current: 1,
+      total: 2,
+      done: false,
+    });
     try {
       const result: SavedProvider = await cswitchApi.saveProvider(editingProvider?.id ?? null, draft);
       setProviderDialogOpen(false);
@@ -121,6 +172,7 @@ function App() {
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      setProgress(null);
       setBusy(null);
     }
   };
@@ -129,6 +181,15 @@ function App() {
     if (!routingProvider) return;
     const provider = routingProvider;
     setBusy("route");
+    setProgress({
+      operation: "activate",
+      title: `切换到 ${provider.name}`,
+      stage: "启用本地路由",
+      detail: "正在启用协议转换并切换供应商。",
+      current: 0,
+      total: 7,
+      done: false,
+    });
     try {
       await cswitchApi.enableProviderRouting(provider.id);
       const report = await cswitchApi.activateProvider(provider.id);
@@ -138,6 +199,7 @@ function App() {
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      setProgress(null);
       setBusy(null);
     }
   };
@@ -158,8 +220,17 @@ function App() {
   };
 
   const useOfficial = async () => {
-    if (busy) return;
+    if (busy || progress) return;
     setBusy("official");
+    setProgress({
+      operation: "official",
+      title: "切换到官方登录",
+      stage: "准备切换",
+      detail: "正在检查官方登录状态。",
+      current: 0,
+      total: 7,
+      done: false,
+    });
     try {
       const report = await cswitchApi.startOfficialLogin();
       await refresh();
@@ -168,6 +239,36 @@ function App() {
       const message = errorText(error);
       if (message !== "官方登录已取消") showNotice("error", message);
     } finally {
+      setProgress(null);
+      setBusy(null);
+    }
+  };
+
+  const toggleKeepOfficialAuth = async () => {
+    if (busy || progress) return;
+    const enabled = !state.keepOfficialAuth;
+    setBusy("keep-auth");
+    setProgress({
+      operation: "keep-auth",
+      title: enabled ? "开启保留官方登录" : "关闭保留官方登录",
+      stage: "准备更新",
+      detail: "正在保存鉴权方式并重新应用当前供应商。",
+      current: 0,
+      total: 3,
+      done: false,
+    });
+    try {
+      setState(await cswitchApi.setKeepOfficialAuth(enabled));
+      showNotice(
+        "success",
+        enabled
+          ? "已开启：切换第三方时保留官方登录，请求走 API Key"
+          : "已关闭：切换第三方时 API Key 直连",
+      );
+    } catch (error) {
+      showNotice("error", errorText(error));
+    } finally {
+      setProgress(null);
       setBusy(null);
     }
   };
@@ -182,6 +283,10 @@ function App() {
   };
 
   const isLoading = busy === "load";
+  const locked = Boolean(busy) || Boolean(progress);
+  const percent = progress && progress.total > 0
+    ? Math.min(100, Math.round((progress.current / progress.total) * 100))
+    : 0;
 
   return (
     <div className="app-shell">
@@ -199,7 +304,7 @@ function App() {
           </span>
           <h1>CSwitch</h1>
         </div>
-        <button className="add-button" type="button" aria-label="添加供应商" title="添加供应商" disabled={Boolean(busy)} onClick={openAdd}>
+        <button className="add-button" type="button" aria-label="添加供应商" title="添加供应商" disabled={locked} onClick={openAdd}>
           <Plus size={19} />
         </button>
       </header>
@@ -207,7 +312,7 @@ function App() {
       <main>
         <section aria-label="官方登录">
           <article className={`provider-card official-card${state.officialActive ? " active" : ""}`}>
-            <button className="provider-select" type="button" disabled={Boolean(busy) || state.officialActive} onClick={useOfficial}>
+            <button className="provider-select" type="button" disabled={locked || state.officialActive} onClick={useOfficial}>
               <span className="provider-icon official-icon" aria-hidden="true">
                 <CircleUserRound size={20} />
               </span>
@@ -228,6 +333,29 @@ function App() {
               </div>
             )}
           </article>
+
+          <article className="auth-mode-card">
+            <div className="auth-mode-copy">
+              <strong>切换第三方时保留官方登录</strong>
+              <p>
+                {state.keepOfficialAuth
+                  ? "当前会保留 ChatGPT 登录态，并把请求转发到所选 API Key。关闭后改为 API Key 直连。"
+                  : "当前是 API Key 直连，会写入 auth.json。开启后保留 ChatGPT 登录，请求改走 API Key。"}
+                {!state.officialAuthAvailable && " 建议先完成一次官方登录再开启。"}
+              </p>
+            </div>
+            <button
+              className={`switch${state.keepOfficialAuth ? " on" : ""}`}
+              type="button"
+              role="switch"
+              aria-checked={state.keepOfficialAuth}
+              aria-label="切换第三方时保留官方登录"
+              disabled={locked}
+              onClick={() => void toggleKeepOfficialAuth()}
+            >
+              <span />
+            </button>
+          </article>
         </section>
 
         <div className="section-heading">
@@ -247,7 +375,7 @@ function App() {
             <ProviderCard
               key={provider.id}
               provider={provider}
-              disabled={Boolean(busy)}
+              disabled={locked}
               activating={busy === provider.id}
               onActivate={() => void activate(provider)}
               onEdit={() => openEdit(provider)}
@@ -280,6 +408,28 @@ function App() {
           }}
           onConfirm={() => void enableRouting()}
         />
+      )}
+
+      {progress && (
+        <div className="progress-overlay" role="dialog" aria-modal="true" aria-labelledby="progress-title">
+          <div className="progress-card">
+            <h2 id="progress-title">{progress.title}</h2>
+            <p className="progress-stage">{progress.stage}</p>
+            {progress.detail && <p className="progress-detail">{progress.detail}</p>}
+            <div className="progress-track" aria-hidden="true">
+              <span style={{ width: `${percent}%` }} />
+            </div>
+            <div className="progress-meta">
+              <span aria-live="polite">{progress.current}/{progress.total}</span>
+              <span>{percent}%</span>
+            </div>
+            {progress.operation === "official" && (
+              <button className="cancel-login-button" type="button" onClick={cancelOfficial}>
+                取消官方登录
+              </button>
+            )}
+          </div>
+        </div>
       )}
 
       {deletingProvider && (

@@ -18,6 +18,18 @@ export interface ProviderState {
   providers: ProviderSummary[];
   activeProviderId: string | null;
   officialActive: boolean;
+  keepOfficialAuth: boolean;
+  officialAuthAvailable: boolean;
+}
+
+export interface OperationProgress {
+  operation: string;
+  title: string;
+  stage: string;
+  detail: string;
+  current: number;
+  total: number;
+  done: boolean;
 }
 
 export interface SavedProvider {

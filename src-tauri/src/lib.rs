@@ -8,7 +8,9 @@ mod model_catalog;
 mod oauth;
 mod operation_lock;
 mod profiles;
+mod progress;
 mod provider_sync;
+mod tray;
 mod upstream;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {

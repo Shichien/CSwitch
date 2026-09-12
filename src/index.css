@@ -149,7 +149,7 @@ button:disabled {
   width: 34px;
   height: 34px;
   border-radius: 8px;
-  background: var(--accent);
+  background: #3b5bdb;
   color: #fff;
 }
 
@@ -253,6 +253,133 @@ main {
 
 .official-card {
   min-height: 82px;
+}
+
+.auth-mode-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  margin-top: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.auth-mode-copy {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.auth-mode-copy strong {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.auth-mode-copy p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.switch {
+  position: relative;
+  width: 44px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--border-strong);
+  cursor: pointer;
+}
+
+.switch.on {
+  background: var(--green);
+}
+
+.switch span {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 160ms ease;
+}
+
+.switch.on span {
+  transform: translateX(18px);
+}
+
+.progress-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--background) 42%, rgb(0 0 0 / 28%));
+  backdrop-filter: blur(10px);
+}
+
+.progress-card {
+  width: min(100%, 440px);
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.progress-card h2 {
+  margin: 0 0 6px;
+  font-size: 16px;
+  font-weight: 680;
+}
+
+.progress-stage {
+  margin: 0 0 14px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.progress-detail {
+  margin: 0 0 16px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+
+.progress-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 220ms ease;
+}
+
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.progress-card .cancel-login-button {
+  margin-top: 16px;
 }
 
 .provider-select {

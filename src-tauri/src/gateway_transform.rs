@@ -15,7 +15,6 @@ struct ChatStream {
     id: Option<String>,
     model: Option<String>,
     text: String,
-    reasoning: String,
     tools: BTreeMap<usize, ChatToolCall>,
     usage: Value,
     finish_reason: Option<String>,
@@ -52,16 +51,66 @@ pub(crate) fn convert_request(
     protocol: &str,
     body: &Value,
 ) -> Result<ConvertedRequest, Box<dyn Error>> {
-    let context = conversion_context(body);
+    let mut body = body.clone();
+    sanitize_responses_body(&mut body);
+    let context = conversion_context(&body);
     let converted = match protocol {
-        "openai_chat" => responses_to_chat(body),
-        "anthropic_messages" => responses_to_anthropic(body),
+        "openai_chat" => responses_to_chat(&body),
+        "anthropic_messages" => responses_to_anthropic(&body),
         _ => Err(format!("本地路由不支持的协议：{protocol}").into()),
     }?;
     Ok(ConvertedRequest {
         body: converted,
         context,
     })
+}
+
+pub(crate) fn sanitize_responses_body(body: &mut Value) {
+    sanitize_item_list(body.get_mut("input"));
+    sanitize_item_list(body.get_mut("output"));
+}
+
+fn sanitize_item_list(value: Option<&mut Value>) {
+    let Some(Value::Array(items)) = value else {
+        return;
+    };
+    items.retain(keep_input_item);
+    for item in items {
+        sanitize_reasoning_item(item);
+    }
+}
+
+fn keep_input_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => persistable_reasoning(item),
+        _ => true,
+    }
+}
+
+fn persistable_reasoning(item: &Value) -> bool {
+    item.get("encrypted_content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|content| !content.is_empty())
+}
+
+fn sanitize_reasoning_item(item: &mut Value) {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return;
+    }
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    let valid_id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("rs"));
+    if !valid_id {
+        object.remove("id");
+    }
+    if !object.get("summary").is_some_and(Value::is_array) {
+        object.insert("summary".into(), json!([]));
+    }
 }
 
 pub(crate) fn convert_response(
@@ -315,7 +364,6 @@ fn chat_to_response(body: &Value, context: &ConversionContext) -> Result<Value, 
             .and_then(Value::as_str)
             .map(str::to_string);
         let message = choice.get("message").unwrap_or(&Value::Null);
-        push_reasoning(&mut output, message.get("reasoning_content"));
         push_message(&mut output, message.get("content"));
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
@@ -533,7 +581,6 @@ fn anthropic_to_response(
         for block in content {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => push_message(&mut output, block.get("text")),
-                Some("thinking") => push_reasoning(&mut output, block.get("thinking")),
                 Some("tool_use") => {
                     let name = block
                         .get("name")
@@ -597,7 +644,6 @@ fn chat_stream_to_response(
             }
             let delta = choice.get("delta").unwrap_or(&Value::Null);
             append_content(&mut stream.text, delta.get("content"));
-            append_content(&mut stream.reasoning, delta.get("reasoning_content"));
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
                     let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -611,7 +657,6 @@ fn chat_stream_to_response(
         }
     }
     let mut output = Vec::new();
-    push_reasoning(&mut output, Some(&Value::String(stream.reasoning)));
     push_message(&mut output, Some(&Value::String(stream.text)));
     for (_, call) in stream.tools {
         output.push(chat_tool_to_response(
@@ -879,16 +924,6 @@ fn push_message(output: &mut Vec<Value>, content: Option<&Value>) {
     }
 }
 
-fn push_reasoning(output: &mut Vec<Value>, content: Option<&Value>) {
-    let Some(content) = content else {
-        return;
-    };
-    let text = content_text(content);
-    if !text.is_empty() {
-        output.push(json!({"type": "reasoning", "id": new_id("rs"), "summary": [{"type": "summary_text", "text": text}]}));
-    }
-}
-
 fn chat_usage(usage: Option<&Value>) -> Value {
     let usage = usage.unwrap_or(&Value::Null);
     let input = usage
@@ -1150,5 +1185,55 @@ mod tests {
         assert!(events.contains("response.created"));
         assert!(events.contains("response.function_call_arguments.done"));
         assert!(events.contains("response.completed"));
+    }
+
+    #[test]
+    fn chat_conversion_does_not_emit_synthetic_reasoning_items() {
+        let converted = chat_to_response(
+            &json!({
+                "id": "chat_1",
+                "model": "fixture-model",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "done",
+                        "reasoning_content": "secret chain of thought"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }),
+            &ConversionContext::default(),
+        )
+        .unwrap();
+        assert_eq!(converted["output"].as_array().unwrap().len(), 1);
+        assert_eq!(converted["output"][0]["type"], "message");
+        assert!(
+            converted["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning")
+        );
+    }
+
+    #[test]
+    fn sanitizes_poisoned_reasoning_ids_like_sub2api() {
+        let mut body = json!({
+            "input": [
+                {"type": "reasoning", "id": "msg_not_rs", "summary": [{"type": "summary_text", "text": "synthetic"}]},
+                {"type": "reasoning", "id": "thought_1", "encrypted_content": "blob"},
+                {"type": "reasoning", "id": "rs_ok", "encrypted_content": "blob", "summary": "bad"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+            ]
+        });
+        sanitize_responses_body(&mut body);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[0]["encrypted_content"], "blob");
+        assert_eq!(input[1]["id"], "rs_ok");
+        assert_eq!(input[1]["summary"], json!([]));
+        assert_eq!(input[2]["type"], "message");
     }
 }

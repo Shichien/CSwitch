@@ -63,8 +63,11 @@ pub(crate) fn build_provider_config(
     original: &str,
     name: &str,
     api_url: &str,
+    api_key: &str,
 ) -> Result<String, Box<dyn Error>> {
+    let api_key = validate_api_key(api_key)?;
     let mut document = parse_config(original)?;
+    document.remove("experimental_bearer_token");
     document["model_provider"] = value(CUSTOM_PROVIDER_ID);
     document.remove("model_catalog_json");
     if !document.contains_key("model_providers") {
@@ -88,6 +91,7 @@ pub(crate) fn build_provider_config(
     provider["base_url"] = value(api_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
+    provider["experimental_bearer_token"] = value(api_key);
     Ok(document.to_string())
 }
 
@@ -102,6 +106,16 @@ pub(crate) fn build_official_config(original: &str) -> Result<String, Box<dyn Er
     let mut document = parse_config(original)?;
     document.remove("model_provider");
     document.remove("model_catalog_json");
+    document.remove("experimental_bearer_token");
+    if let Some(providers) = document
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        && let Some(provider) = providers
+            .get_mut(CUSTOM_PROVIDER_ID)
+            .and_then(Item::as_table_mut)
+    {
+        provider.remove("experimental_bearer_token");
+    }
     Ok(document.to_string())
 }
 
@@ -135,6 +149,14 @@ pub(crate) fn custom_provider(document: &DocumentMut) -> Option<&Table> {
         .and_then(Item::as_table)
 }
 
+pub(crate) fn custom_bearer_token(document: &DocumentMut) -> Option<&str> {
+    custom_provider(document)
+        .and_then(|provider| provider.get("experimental_bearer_token"))
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
 pub(crate) fn verify_provider_content(
     config: &[u8],
     auth: &[u8],
@@ -144,6 +166,7 @@ pub(crate) fn verify_provider_content(
     let content = std::str::from_utf8(config)?;
     let document = parse_config(content)?;
     let provider = custom_provider(&document).ok_or("写入后的 custom 提供方不存在")?;
+    let expected_key = api_key_from_auth(auth)?.ok_or("供应商缺少 API Key")?;
     let auth: Value = serde_json::from_slice(auth)?;
     let auth_has_only_api_key = auth.as_object().is_some_and(|object| {
         object.len() == 1
@@ -157,6 +180,10 @@ pub(crate) fn verify_provider_content(
         && provider.get("base_url").and_then(Item::as_str) == Some(expected_url)
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
         && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
+        && provider
+            .get("experimental_bearer_token")
+            .and_then(Item::as_str)
+            == Some(expected_key.as_str())
         && !document.contains_key("model_catalog_json")
         && auth_has_only_api_key;
     if !valid {

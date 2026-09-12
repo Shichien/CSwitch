@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
+  OperationProgress,
   ProviderDraft,
   ProviderState,
   ProviderSyncReport,
@@ -21,7 +23,15 @@ export const cswitchApi = {
     invoke<void>("enable_provider_routing", { providerId }),
   deleteProvider: (providerId: string) =>
     invoke<void>("delete_provider", { providerId }),
+  setKeepOfficialAuth: (enabled: boolean) =>
+    invoke<ProviderState>("set_keep_official_auth", { enabled }),
   startOfficialLogin: () =>
     invoke<ProviderSyncReport>("start_official_login"),
   cancelOfficialLogin: () => invoke<void>("cancel_official_login"),
+  onProgress: (handler: (progress: OperationProgress) => void) =>
+    listen<OperationProgress>("cswitch://operation-progress", (event) => handler(event.payload)),
+  onProvidersChanged: (handler: () => void) =>
+    listen("cswitch://providers-changed", () => handler()),
+  onOperationError: (handler: (message: string) => void) =>
+    listen<string>("cswitch://operation-error", (event) => handler(event.payload)),
 };

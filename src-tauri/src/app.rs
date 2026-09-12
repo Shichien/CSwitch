@@ -5,16 +5,18 @@ use std::path::Path;
 use toml_edit::Item;
 
 use crate::{
-    codex_process, config, gateway, model_catalog, oauth, profiles, provider_sync, upstream,
+    codex_process, config, gateway, model_catalog, oauth, profiles, progress, provider_sync,
+    upstream,
 };
 use config::{
     api_key_from_auth, build_custom_auth, build_official_config, build_provider_config,
-    config_selects_custom, custom_provider, is_official_config, normalize_api_url, parse_config,
-    validate_api_key, validate_provider_name, verify_provider_content,
+    config_selects_custom, custom_bearer_token, custom_provider, is_official_config,
+    normalize_api_url, parse_config, validate_api_key, validate_provider_name,
+    verify_provider_content,
 };
 use oauth::{AuthHealth, LocalAuthState};
-use profiles::ProfileStore;
-use profiles::ProviderRecord;
+use profiles::{AppSettings, ProfileStore, ProviderRecord};
+use progress::ProgressReporter;
 use provider_sync::{AuthUpdate, ProviderSyncReport};
 
 const PROVIDER_ID: &str = "custom";
@@ -22,22 +24,24 @@ const OFFICIAL_PROVIDER_ID: &str = "openai";
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderSummary {
-    id: String,
-    name: String,
-    api_url: String,
-    model_count: usize,
-    has_api_key: bool,
-    active: bool,
-    protocol: String,
-    routing_mode: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) api_url: String,
+    pub(crate) model_count: usize,
+    pub(crate) has_api_key: bool,
+    pub(crate) active: bool,
+    pub(crate) protocol: String,
+    pub(crate) routing_mode: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderState {
-    providers: Vec<ProviderSummary>,
-    active_provider_id: Option<String>,
-    official_active: bool,
+    pub(crate) providers: Vec<ProviderSummary>,
+    pub(crate) active_provider_id: Option<String>,
+    pub(crate) official_active: bool,
+    pub(crate) keep_official_auth: bool,
+    pub(crate) official_auth_available: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +85,8 @@ pub(crate) fn list_provider_state(codex_home: &Path) -> Result<ProviderState, Bo
         providers,
         active_provider_id,
         official_active,
+        keep_official_auth: profiles.keep_official_auth()?,
+        official_auth_available: official_credential_available(codex_home, &profiles)?,
     })
 }
 
@@ -110,7 +116,7 @@ pub(crate) fn save_provider_inner(
     let auth = build_custom_auth(&key)?;
     let direct_base_url =
         upstream::base_url_for_endpoint(&detection.inference_endpoint, &detection.protocol)?;
-    let config = build_provider_config(source_text, name, &direct_base_url)?;
+    let config = build_provider_config(source_text, name, &direct_base_url, &key)?;
     let record = profiles.save_provider_with_routing(
         provider_id,
         name,
@@ -179,7 +185,7 @@ where
         .unwrap_or_default();
     let source_text = std::str::from_utf8(&source)?;
     let auth = build_custom_auth(&key)?;
-    let config = build_provider_config(source_text, name, &api_url)?;
+    let config = build_provider_config(source_text, name, &api_url, &key)?;
     let record = profiles.save_provider(
         provider_id,
         name,
@@ -240,6 +246,53 @@ fn provider_summary(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn set_keep_official_auth_inner(
+    codex_home: &Path,
+    enabled: bool,
+) -> Result<ProviderState, Box<dyn Error>> {
+    set_keep_official_auth_with_progress(codex_home, enabled, &ProgressReporter::default())
+}
+
+pub(crate) fn set_keep_official_auth_with_progress(
+    codex_home: &Path,
+    enabled: bool,
+    progress: &ProgressReporter,
+) -> Result<ProviderState, Box<dyn Error>> {
+    ensure_provider_migration(codex_home)?;
+    progress.stage(
+        1,
+        3,
+        "保存设置",
+        if enabled {
+            "正在开启：切换第三方时保留 ChatGPT 登录，请求走 API Key。"
+        } else {
+            "正在关闭：切换第三方时改为 API Key 直连。"
+        },
+    );
+    let profiles = ProfileStore::new(codex_home);
+    profiles.save_settings(&AppSettings {
+        keep_official_auth: enabled,
+    })?;
+    let records = profiles.list_providers()?;
+    if let Some(active_id) = detect_active_provider_id(codex_home, &profiles, &records)? {
+        progress.stage(
+            2,
+            3,
+            "重新应用供应商",
+            "正在按新的鉴权方式重写当前 Codex 配置。",
+        );
+        activate_provider_inner_with_progress(
+            codex_home,
+            &active_id,
+            codex_process::close_if_running,
+            progress,
+        )?;
+    }
+    progress.stage(3, 3, "完成", "鉴权方式已更新。");
+    list_provider_state(codex_home)
+}
+
 pub(crate) fn enable_provider_routing_inner(
     codex_home: &Path,
     provider_id: &str,
@@ -259,13 +312,7 @@ pub(crate) fn enable_provider_routing_inner(
     Ok(())
 }
 
-pub(crate) fn activate_provider_inner(
-    codex_home: &Path,
-    provider_id: &str,
-) -> Result<ProviderSyncReport, Box<dyn Error>> {
-    activate_provider_inner_with_close(codex_home, provider_id, codex_process::close_if_running)
-}
-
+#[cfg(test)]
 fn activate_provider_inner_with_close<C>(
     codex_home: &Path,
     provider_id: &str,
@@ -274,10 +321,41 @@ fn activate_provider_inner_with_close<C>(
 where
     C: FnOnce() -> Result<bool, Box<dyn Error>>,
 {
+    activate_provider_inner_with_progress(
+        codex_home,
+        provider_id,
+        close_codex,
+        &ProgressReporter::default(),
+    )
+}
+
+pub(crate) fn activate_provider_inner_with_progress<C>(
+    codex_home: &Path,
+    provider_id: &str,
+    close_codex: C,
+    progress: &ProgressReporter,
+) -> Result<ProviderSyncReport, Box<dyn Error>>
+where
+    C: FnOnce() -> Result<bool, Box<dyn Error>>,
+{
+    const TOTAL: u32 = 7;
+    progress.stage(1, TOTAL, "准备切换", "正在读取供应商配置并恢复未完成的操作。");
     ensure_provider_migration(codex_home)?;
     let profiles = ProfileStore::new(codex_home);
     let mut target = profiles.load_provider(provider_id)?;
+    progress.stage(
+        2,
+        TOTAL,
+        "读取供应商",
+        &format!("正在加载 {} 的配置和密钥。", target.record.name),
+    );
     if target.catalog.is_none() || target.record.inference_endpoint.is_none() {
+        progress.stage(
+            2,
+            TOTAL,
+            "探测上游协议",
+            "供应商缺少探测结果，正在探测协议并拉取模型目录。",
+        );
         let key = api_key_from_auth(&target.auth)?.ok_or("供应商缺少 API Key")?;
         let detection = upstream::detect(&target.record.api_url, &key)?;
         let catalog =
@@ -293,7 +371,7 @@ where
         } else {
             "direct"
         };
-        let config = build_provider_config(source, &target.record.name, &direct_base_url)?;
+        let config = build_provider_config(source, &target.record.name, &direct_base_url, &key)?;
         let record = profiles.save_provider_with_routing(
             Some(provider_id),
             &target.record.name,
@@ -314,6 +392,7 @@ where
         )
         .into());
     }
+    let provider_key = api_key_from_auth(&target.auth)?.ok_or("供应商缺少 API Key")?;
     let original = read_optional_file(&codex_home.join("config.toml"))?;
     let original_bytes = original.as_deref().unwrap_or_default();
     let original_text = std::str::from_utf8(original_bytes)?;
@@ -325,17 +404,46 @@ where
         .filter(|profile| profile.record.routing_mode == "local")
         .map(|profile| profile.record.id);
     let using_gateway = target.record.routing_mode == "local";
-    let activated = codex_process::after_closed_with(close_codex, || {
-        if let Some(active_id) = active_id.as_deref().filter(|id| *id != provider_id)
-            && let Some(active_auth) = read_optional_file(&codex_home.join("auth.json"))?
-        {
-            profiles.update_provider_snapshot(active_id, original_bytes, &active_auth)?;
+    let keep_official_auth = profiles.keep_official_auth()?;
+    let saved_official_auth = profiles
+        .load_official()?
+        .map(|profile| profile.auth)
+        .filter(|auth| oauth::inspect_auth(auth) != LocalAuthState::Invalid);
+    let close_with_progress = || {
+        progress.stage(
+            3,
+            TOTAL,
+            "关闭 Codex 桌面端",
+            "正在请求 Codex 退出，避免配置文件被占用。最多等待 5 秒。",
+        );
+        close_codex()
+    };
+    let activated = codex_process::after_closed_with(close_with_progress, || {
+        progress.stage(
+            4,
+            TOTAL,
+            "备份当前配置",
+            "正在保存当前供应商或官方登录的快照。",
+        );
+        if let Some(active_id) = active_id.as_deref().filter(|id| *id != provider_id) {
+            snapshot_provider_without_clobbering_key(
+                &profiles,
+                active_id,
+                original_bytes,
+                read_optional_file(&codex_home.join("auth.json"))?.as_deref(),
+            )?;
         }
         if is_official_config(original_text)? {
             capture_official_profile(codex_home, &profiles, original_bytes)?;
         }
 
         let active_base_url = if using_gateway {
+            progress.stage(
+                5,
+                TOTAL,
+                "启动本地路由",
+                "正在启动协议转换网关，把请求转成 Responses。",
+            );
             match gateway::ensure_running(codex_home, provider_id) {
                 Ok(port) => gateway::local_base_url(port),
                 Err(error) => {
@@ -346,6 +454,12 @@ where
                 }
             }
         } else {
+            progress.stage(
+                5,
+                TOTAL,
+                "写入供应商配置",
+                "正在写入 config.toml，并按当前鉴权方式设置请求密钥。",
+            );
             match target.record.inference_endpoint.as_deref() {
                 Some(endpoint) => {
                     upstream::base_url_for_endpoint(endpoint, &target.record.protocol)?
@@ -356,7 +470,12 @@ where
                 None => return Err("供应商缺少已探测的推理接口".into()),
             }
         };
-        let updated = build_provider_config(original_text, &target.record.name, &active_base_url)?;
+        let updated = build_provider_config(
+            original_text,
+            &target.record.name,
+            &active_base_url,
+            &provider_key,
+        )?;
         verify_provider_content(
             updated.as_bytes(),
             &target.auth,
@@ -364,12 +483,27 @@ where
             &active_base_url,
         )?;
         profiles.update_provider_snapshot(provider_id, updated.as_bytes(), &target.auth)?;
-        activate_custom(
+        let live_auth = read_optional_file(&codex_home.join("auth.json"))?;
+        let auth_update = resolve_live_auth_update(
+            keep_official_auth,
+            live_auth.as_deref(),
+            saved_official_auth.as_deref(),
+            &target.auth,
+        );
+        progress.stage(
+            6,
+            TOTAL,
+            "同步会话历史",
+            "正在更新 Codex 会话记录，文件较多时会多等一会儿。",
+        );
+        let report = activate_custom(
             codex_home,
             original.as_deref(),
             updated.as_bytes(),
-            &target.auth,
-        )
+            auth_update,
+        )?;
+        progress.stage(7, TOTAL, "完成", "供应商已切换。");
+        Ok(report)
     });
     match activated {
         Ok(report) => {
@@ -475,10 +609,12 @@ fn detect_active_provider_id(
     let Some(api_url) = api_url else {
         return Ok(None);
     };
-    let Some(auth) = read_optional_file(&codex_home.join("auth.json"))? else {
-        return Ok(None);
-    };
-    let key = api_key_from_auth(&auth)?;
+    let live_key = read_optional_file(&codex_home.join("auth.json"))?
+        .as_deref()
+        .map(api_key_from_auth)
+        .transpose()?
+        .flatten();
+    let live_bearer = custom_bearer_token(&document).map(str::to_string);
     for record in records {
         let expected_url = if record.routing_mode == "local" {
             gateway::active_base_url(codex_home, &record.id)
@@ -491,17 +627,24 @@ fn detect_active_provider_id(
                 })
                 .or_else(|| Some(record.api_url.clone()))
         };
-        if record.name == name && expected_url.as_deref() == Some(api_url.as_str()) {
-            let profile = profiles.load_provider(&record.id)?;
-            if api_key_from_auth(&profile.auth)? == key {
-                return Ok(Some(record.id.clone()));
-            }
+        if record.name != name || expected_url.as_deref() != Some(api_url.as_str()) {
+            continue;
+        }
+        let profile = profiles.load_provider(&record.id)?;
+        let profile_key = api_key_from_auth(&profile.auth)?;
+        if profile_key.as_ref() == live_bearer.as_ref() || profile_key == live_key {
+            return Ok(Some(record.id.clone()));
         }
     }
     Ok(None)
 }
 
-pub(crate) fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn Error>> {
+pub(crate) fn switch_to_official_with_progress(
+    codex_home: &Path,
+    progress: &ProgressReporter,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    const TOTAL: u32 = 7;
+    progress.stage(1, TOTAL, "准备切换", "正在检查官方登录状态。");
     oauth::ensure_login_active()?;
     fs::create_dir_all(codex_home)?;
     let config_path = codex_home.join("config.toml");
@@ -513,12 +656,21 @@ pub(crate) fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport
     let saved_profile = profiles.load_official()?;
 
     if !active_is_official {
+        progress.stage(
+            2,
+            TOTAL,
+            "备份当前供应商",
+            "正在保存当前第三方供应商配置，避免覆盖 API Key。",
+        );
         if profiles.provider_registry_exists() {
             let records = profiles.list_providers()?;
-            if let Some(active_id) = detect_active_provider_id(codex_home, &profiles, &records)?
-                && let Some(auth) = read_custom_auth_for_profile(codex_home)?
-            {
-                profiles.update_provider_snapshot(&active_id, original_bytes, &auth)?;
+            if let Some(active_id) = detect_active_provider_id(codex_home, &profiles, &records)? {
+                snapshot_provider_without_clobbering_key(
+                    &profiles,
+                    &active_id,
+                    original_bytes,
+                    read_optional_file(&codex_home.join("auth.json"))?.as_deref(),
+                )?;
             }
         } else {
             profiles.save_custom_config(original_bytes)?;
@@ -555,21 +707,60 @@ pub(crate) fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport
         push_unique_auth(&mut candidates, profile.auth.clone());
     }
 
+    progress.stage(
+        3,
+        TOTAL,
+        "检查官方登录",
+        "正在检查已保存的 ChatGPT 登录是否仍然有效。",
+    );
     let official_auth = match select_official_auth(&candidates)? {
         Some(auth) => auth,
-        None => oauth::browser_login()?,
+        None => {
+            progress.stage(
+                3,
+                TOTAL,
+                "等待浏览器登录",
+                "请在打开的浏览器里完成 ChatGPT 登录。最多等待 10 分钟，可随时取消。",
+            );
+            oauth::browser_login()?
+        }
     };
 
     oauth::ensure_login_active()?;
-    let report = codex_process::after_closed(|| {
-        profiles.save_official(&official_config, &official_auth)?;
-        activate_official(
-            codex_home,
-            original.as_deref(),
-            &official_config,
-            &official_auth,
-        )
-    })?;
+    let report = codex_process::after_closed_with(
+        || {
+            progress.stage(
+                4,
+                TOTAL,
+                "关闭 Codex 桌面端",
+                "正在请求 Codex 退出，避免配置文件被占用。最多等待 5 秒。",
+            );
+            codex_process::close_if_running()
+        },
+        || {
+            progress.stage(
+                5,
+                TOTAL,
+                "写入官方配置",
+                "正在恢复官方 config.toml 和 ChatGPT 登录态。",
+            );
+            profiles.save_official(&official_config, &official_auth)?;
+            progress.stage(
+                6,
+                TOTAL,
+                "同步会话历史",
+                "正在更新 Codex 会话记录，文件较多时会多等一会儿。",
+            );
+            let report = activate_official(
+                codex_home,
+                original.as_deref(),
+                &official_config,
+                &official_auth,
+            )?;
+            progress.stage(7, TOTAL, "完成", "已切换到官方登录。");
+            Ok(report)
+        },
+    )?;
     gateway::stop(codex_home)?;
     Ok(report)
 }
@@ -642,15 +833,66 @@ fn activate_custom(
     codex_home: &Path,
     original_config: Option<&[u8]>,
     updated_config: &[u8],
-    custom_auth: &[u8],
+    auth_update: AuthUpdate<'_>,
 ) -> Result<ProviderSyncReport, Box<dyn Error>> {
     provider_sync::apply_provider_state(
         codex_home,
         original_config,
         updated_config,
         PROVIDER_ID,
-        AuthUpdate::Replace(custom_auth),
+        auth_update,
     )
+}
+
+fn resolve_live_auth_update<'a>(
+    keep_official_auth: bool,
+    live_auth: Option<&'a [u8]>,
+    saved_official_auth: Option<&'a [u8]>,
+    provider_auth: &'a [u8],
+) -> AuthUpdate<'a> {
+    if !keep_official_auth {
+        return AuthUpdate::Replace(provider_auth);
+    }
+    if live_auth.is_some_and(is_official_credential) {
+        return AuthUpdate::Keep;
+    }
+    if let Some(official) = saved_official_auth.filter(|auth| is_official_credential(auth)) {
+        return AuthUpdate::Replace(official);
+    }
+    AuthUpdate::Replace(provider_auth)
+}
+
+fn snapshot_provider_without_clobbering_key(
+    profiles: &ProfileStore,
+    provider_id: &str,
+    config: &[u8],
+    live_auth: Option<&[u8]>,
+) -> Result<(), Box<dyn Error>> {
+    let stored = profiles.load_provider(provider_id)?;
+    let auth = match live_auth {
+        Some(auth) if api_key_from_auth(auth)?.is_some() => auth.to_vec(),
+        _ => stored.auth,
+    };
+    profiles.update_provider_snapshot(provider_id, config, &auth)
+}
+
+fn is_official_credential(auth: &[u8]) -> bool {
+    oauth::inspect_auth(auth) != LocalAuthState::Invalid
+}
+
+fn official_credential_available(
+    codex_home: &Path,
+    profiles: &ProfileStore,
+) -> Result<bool, Box<dyn Error>> {
+    if read_optional_file(&codex_home.join("auth.json"))?
+        .as_deref()
+        .is_some_and(is_official_credential)
+    {
+        return Ok(true);
+    }
+    Ok(profiles
+        .load_official()?
+        .is_some_and(|profile| is_official_credential(&profile.auth)))
 }
 
 fn activate_official(

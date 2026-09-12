@@ -109,7 +109,6 @@ struct TransactionJournal {
 
 #[derive(Clone, Copy)]
 pub enum AuthUpdate<'a> {
-    #[cfg(test)]
     Keep,
     Replace(&'a [u8]),
 }
@@ -290,7 +289,6 @@ where
         }
 
         match auth_update {
-            #[cfg(test)]
             AuthUpdate::Keep => {}
             AuthUpdate::Replace(auth) => {
                 auth_mutated = original_auth.as_deref() != Some(auth);

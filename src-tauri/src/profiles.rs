@@ -13,6 +13,7 @@ const PROFILE_DIR: &str = "cswitch-profiles";
 const LEGACY_PROFILE_DIR: &str = "qpp-profiles";
 const PROVIDERS_FILE: &str = "providers.json";
 const PROVIDERS_DIR: &str = "providers";
+const SETTINGS_FILE: &str = "settings.json";
 const CURRENT_FILE: &str = "current";
 const GENERATIONS_DIR: &str = "generations";
 const EMPTY_GENERATION: &str = "none";
@@ -21,6 +22,21 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 pub struct OfficialProfile {
     pub auth: Vec<u8>,
     pub config: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    #[serde(default)]
+    pub keep_official_auth: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            keep_official_auth: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +163,25 @@ impl ProfileStore {
             self.save_registry(&ProviderRegistry::default())?;
         }
         Ok(())
+    }
+
+    pub fn load_settings(&self) -> Result<AppSettings, Box<dyn Error>> {
+        let Some(content) = read_optional(&self.settings_path())? else {
+            return Ok(AppSettings::default());
+        };
+        serde_json::from_slice(&content)
+            .map_err(|error| format!("应用设置格式无效：{error}").into())
+    }
+
+    pub fn save_settings(&self, settings: &AppSettings) -> Result<(), Box<dyn Error>> {
+        create_private_dir(&self.root)?;
+        let content = serde_json::to_vec_pretty(settings)?;
+        atomic_write_private(&self.settings_path(), &content)?;
+        verify_file(&self.settings_path(), &content)
+    }
+
+    pub fn keep_official_auth(&self) -> Result<bool, Box<dyn Error>> {
+        Ok(self.load_settings()?.keep_official_auth)
     }
 
     pub fn list_providers(&self) -> Result<Vec<ProviderRecord>, Box<dyn Error>> {
@@ -435,6 +470,10 @@ impl ProfileStore {
 
     fn registry_path(&self) -> PathBuf {
         self.root.join(PROVIDERS_FILE)
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        self.root.join(SETTINGS_FILE)
     }
 
     fn provider_dir(&self, id: &str) -> PathBuf {
@@ -942,5 +981,18 @@ mod tests {
             fs::read(current.join("marker")).expect("read current"),
             b"current"
         );
+    }
+
+    #[test]
+    fn keep_official_auth_defaults_off_and_round_trips() {
+        let directory = tempdir().expect("tempdir");
+        let store = ProfileStore::new(directory.path());
+        assert!(!store.keep_official_auth().expect("default setting"));
+        store
+            .save_settings(&AppSettings {
+                keep_official_auth: true,
+            })
+            .expect("save settings");
+        assert!(store.keep_official_auth().expect("saved setting"));
     }
 }

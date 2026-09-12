@@ -4,13 +4,6 @@ use std::path::Path;
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
-pub(crate) fn after_closed<T, F>(action: F) -> Result<T, Box<dyn Error>>
-where
-    F: FnOnce() -> Result<T, Box<dyn Error>>,
-{
-    after_closed_with(close_if_running, action)
-}
-
 pub(crate) fn after_closed_with<T, C, F>(close: C, action: F) -> Result<T, Box<dyn Error>>
 where
     C: FnOnce() -> Result<bool, Box<dyn Error>>,
