@@ -54,7 +54,6 @@ pub struct ProviderProfile {
     pub auth: Vec<u8>,
     pub config: Vec<u8>,
     pub catalog: Option<Vec<u8>>,
-    pub catalog_path: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -167,37 +166,33 @@ impl ProfileStore {
             .map_err(|error| format!("读取供应商 auth.json 失败：{error}"))?;
         let config = fs::read(directory.join("config.toml"))
             .map_err(|error| format!("读取供应商 config.toml 失败：{error}"))?;
-        let (catalog, catalog_path) = match record.catalog_file.as_deref() {
+        let catalog = match record.catalog_file.as_deref() {
             Some(file) => {
                 validate_catalog_file(file)?;
                 let path = directory.join(file);
                 let content = fs::read(&path)
                     .map_err(|error| format!("读取供应商 models.json 失败：{error}"))?;
-                (Some(content), Some(path))
+                Some(content)
             }
-            None => (None, None),
+            None => None,
         };
         Ok(ProviderProfile {
             record,
             auth,
             config,
             catalog,
-            catalog_path,
         })
     }
 
-    pub fn save_provider<F>(
+    pub fn save_provider(
         &self,
         id: Option<&str>,
         name: &str,
         api_url: &str,
         auth: &[u8],
         catalog: Option<&[u8]>,
-        build_config: F,
-    ) -> Result<ProviderRecord, Box<dyn Error>>
-    where
-        F: FnOnce(Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>>,
-    {
+        config: &[u8],
+    ) -> Result<ProviderRecord, Box<dyn Error>> {
         let inference_endpoint = format!("{}/responses", api_url.trim_end_matches('/'));
         self.save_provider_with_routing(
             id,
@@ -208,12 +203,12 @@ impl ProfileStore {
             "openai_responses",
             "direct",
             Some(&inference_endpoint),
-            build_config,
+            config,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn save_provider_with_routing<F>(
+    pub fn save_provider_with_routing(
         &self,
         id: Option<&str>,
         name: &str,
@@ -223,11 +218,8 @@ impl ProfileStore {
         protocol: &str,
         routing_mode: &str,
         inference_endpoint: Option<&str>,
-        build_config: F,
-    ) -> Result<ProviderRecord, Box<dyn Error>>
-    where
-        F: FnOnce(Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>>,
-    {
+        config: &[u8],
+    ) -> Result<ProviderRecord, Box<dyn Error>> {
         validate_routing(protocol, routing_mode, inference_endpoint)?;
         let mut registry = self.load_registry()?;
         let existing_index = match id {
@@ -260,7 +252,6 @@ impl ProfileStore {
         let directory = self.provider_dir(&id);
         create_private_dir(&directory)?;
         let catalog_path = catalog.map(|_| directory.join(generate_catalog_file()));
-        let config = build_config(catalog_path.as_deref())?;
         let auth_path = directory.join("auth.json");
         let config_path = directory.join("config.toml");
         let previous_auth = read_optional(&auth_path)?;
@@ -272,9 +263,9 @@ impl ProfileStore {
                 verify_file(path, content)?;
             }
             atomic_write_private(&auth_path, auth)?;
-            atomic_write_private(&config_path, &config)?;
+            atomic_write_private(&config_path, config)?;
             verify_file(&auth_path, auth)?;
-            verify_file(&config_path, &config)?;
+            verify_file(&config_path, config)?;
 
             let now = Utc::now().to_rfc3339();
             let record = ProviderRecord {
@@ -330,7 +321,7 @@ impl ProfileStore {
         auth: &[u8],
         config: &[u8],
     ) -> Result<ProviderRecord, Box<dyn Error>> {
-        self.save_provider(None, name, api_url, auth, None, |_| Ok(config.to_vec()))
+        self.save_provider(None, name, api_url, auth, None, config)
     }
 
     pub fn update_provider_snapshot(

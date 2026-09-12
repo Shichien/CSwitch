@@ -43,6 +43,7 @@ fn save_fixture_provider(
         .expect("read config")
         .unwrap_or_default();
     let source = std::str::from_utf8(&source).expect("utf8 config");
+    let config = build_provider_config(source, name, api_url).expect("build provider config");
     profiles
         .save_provider(
             None,
@@ -50,9 +51,7 @@ fn save_fixture_provider(
             api_url,
             &auth,
             Some(&catalog.bytes),
-            |catalog_path| {
-                build_provider_config(source, name, api_url, catalog_path).map(String::into_bytes)
-            },
+            config.as_bytes(),
         )
         .expect("save provider")
 }
@@ -100,14 +99,8 @@ name = "Old"
 base_url = "https://old.example"
 request_max_retries = 9
 "#;
-    let catalog_path = Path::new("/fixture/providers/models-new.json");
-    let updated = build_provider_config(
-        original,
-        "新供应商",
-        "https://api.example.com",
-        Some(catalog_path),
-    )
-    .expect("build config");
+    let updated = build_provider_config(original, "新供应商", "https://api.example.com")
+        .expect("build config");
     let document = parse_config(&updated).expect("parse config");
     assert_eq!(document["model"].as_str(), Some("official-model"));
     assert_eq!(document["model_reasoning_effort"].as_str(), Some("xhigh"));
@@ -127,9 +120,18 @@ request_max_retries = 9
         Some("新供应商")
     );
     assert_eq!(
-        document["model_catalog_json"].as_str(),
-        Some(catalog_path.to_string_lossy().as_ref())
+        document["model_providers"]["custom"]["base_url"].as_str(),
+        Some("https://api.example.com")
     );
+    assert_eq!(
+        document["model_providers"]["custom"]["wire_api"].as_str(),
+        Some("responses")
+    );
+    assert_eq!(
+        document["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
+        Some(true)
+    );
+    assert!(!document.contains_key("model_catalog_json"));
     assert_eq!(
         document["model_providers"]["custom"]
             .get("request_max_retries")
@@ -182,7 +184,6 @@ fn stores_multiple_providers_with_independent_credentials_and_catalogs() {
         catalog_ids(second_profile.catalog.as_deref().unwrap()),
         ["model-two"]
     );
-    assert_ne!(first_profile.catalog_path, second_profile.catalog_path);
 }
 
 #[test]
@@ -238,6 +239,7 @@ fn switching_providers_updates_auth_catalog_model_and_active_marker() {
     let first_document = parse_config(&first_config).expect("parse first config");
     assert_eq!(first_document["model"].as_str(), Some("official-model"));
     assert_eq!(first_document["approval_policy"].as_str(), Some("never"));
+    assert!(!first_document.contains_key("model_catalog_json"));
     assert_eq!(
         api_key_from_auth(&fs::read(codex_home.join("auth.json")).unwrap())
             .unwrap()
@@ -260,6 +262,7 @@ fn switching_providers_updates_auth_catalog_model_and_active_marker() {
         second_document["model_providers"]["custom"]["name"].as_str(),
         Some("供应商二")
     );
+    assert!(!second_document.contains_key("model_catalog_json"));
     assert!(delete_provider_inner(codex_home, &second.id).is_err());
     delete_provider_inner(codex_home, &first.id).expect("delete inactive provider");
     assert_eq!(
@@ -339,7 +342,6 @@ fn migrates_the_legacy_custom_profile_once() {
         "model = \"legacy-model\"\n",
         "旧供应商",
         "https://legacy.example",
-        None,
     )
     .expect("legacy config");
     profiles

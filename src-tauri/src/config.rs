@@ -1,6 +1,5 @@
 use serde_json::{Value, json};
 use std::error::Error;
-use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 
@@ -64,15 +63,10 @@ pub(crate) fn build_provider_config(
     original: &str,
     name: &str,
     api_url: &str,
-    catalog_path: Option<&Path>,
 ) -> Result<String, Box<dyn Error>> {
     let mut document = parse_config(original)?;
     document["model_provider"] = value(CUSTOM_PROVIDER_ID);
-    if let Some(path) = catalog_path {
-        document["model_catalog_json"] = value(path.to_string_lossy().as_ref());
-    } else {
-        document.remove("model_catalog_json");
-    }
+    document.remove("model_catalog_json");
     if !document.contains_key("model_providers") {
         let mut providers = Table::new();
         providers.set_implicit(true);
@@ -146,7 +140,6 @@ pub(crate) fn verify_provider_content(
     auth: &[u8],
     expected_name: &str,
     expected_url: &str,
-    expected_catalog: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let content = std::str::from_utf8(config)?;
     let document = parse_config(content)?;
@@ -164,8 +157,7 @@ pub(crate) fn verify_provider_content(
         && provider.get("base_url").and_then(Item::as_str) == Some(expected_url)
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
         && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
-        && document.get("model_catalog_json").and_then(Item::as_str)
-            == Some(expected_catalog.to_string_lossy().as_ref())
+        && !document.contains_key("model_catalog_json")
         && auth_has_only_api_key;
     if !valid {
         return Err("配置写入后的验证未通过".into());

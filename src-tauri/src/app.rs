@@ -110,6 +110,7 @@ pub(crate) fn save_provider_inner(
     let auth = build_custom_auth(&key)?;
     let direct_base_url =
         upstream::base_url_for_endpoint(&detection.inference_endpoint, &detection.protocol)?;
+    let config = build_provider_config(source_text, name, &direct_base_url)?;
     let record = profiles.save_provider_with_routing(
         provider_id,
         name,
@@ -119,10 +120,7 @@ pub(crate) fn save_provider_inner(
         &detection.protocol,
         "direct",
         Some(&detection.inference_endpoint),
-        |catalog_path| {
-            build_provider_config(source_text, name, &direct_base_url, catalog_path)
-                .map(|config| config.into_bytes())
-        },
+        config.as_bytes(),
     )?;
     let profile = profiles.load_provider(&record.id)?;
     let active_provider_id =
@@ -181,16 +179,14 @@ where
         .unwrap_or_default();
     let source_text = std::str::from_utf8(&source)?;
     let auth = build_custom_auth(&key)?;
+    let config = build_provider_config(source_text, name, &api_url)?;
     let record = profiles.save_provider(
         provider_id,
         name,
         &api_url,
         &auth,
         Some(&catalog.bytes),
-        |catalog_path| {
-            build_provider_config(source_text, name, &api_url, catalog_path)
-                .map(|config| config.into_bytes())
-        },
+        config.as_bytes(),
     )?;
     let profile = profiles.load_provider(&record.id)?;
     let active_provider_id =
@@ -297,6 +293,7 @@ where
         } else {
             "direct"
         };
+        let config = build_provider_config(source, &target.record.name, &direct_base_url)?;
         let record = profiles.save_provider_with_routing(
             Some(provider_id),
             &target.record.name,
@@ -306,10 +303,7 @@ where
             &detection.protocol,
             routing_mode,
             Some(&detection.inference_endpoint),
-            |catalog_path| {
-                build_provider_config(source, &target.record.name, &direct_base_url, catalog_path)
-                    .map(|config| config.into_bytes())
-            },
+            config.as_bytes(),
         )?;
         target = profiles.load_provider(&record.id)?;
     }
@@ -330,10 +324,6 @@ where
         .and_then(|id| profiles.load_provider(id).ok())
         .filter(|profile| profile.record.routing_mode == "local")
         .map(|profile| profile.record.id);
-    let catalog_path = target
-        .catalog_path
-        .as_deref()
-        .ok_or("供应商模型目录不存在")?;
     let using_gateway = target.record.routing_mode == "local";
     let activated = codex_process::after_closed_with(close_codex, || {
         if let Some(active_id) = active_id.as_deref().filter(|id| *id != provider_id)
@@ -366,18 +356,12 @@ where
                 None => return Err("供应商缺少已探测的推理接口".into()),
             }
         };
-        let updated = build_provider_config(
-            original_text,
-            &target.record.name,
-            &active_base_url,
-            Some(catalog_path),
-        )?;
+        let updated = build_provider_config(original_text, &target.record.name, &active_base_url)?;
         verify_provider_content(
             updated.as_bytes(),
             &target.auth,
             &target.record.name,
             &active_base_url,
-            catalog_path,
         )?;
         profiles.update_provider_snapshot(provider_id, updated.as_bytes(), &target.auth)?;
         activate_custom(

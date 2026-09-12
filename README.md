@@ -7,12 +7,11 @@ CSwitch 用于在 Codex 官方登录和多个第三方 API 供应商之间切换
 - 保存官方登录对应的 `auth.json` 和 `config.toml`，切回官方时按原内容恢复。
 - 为每个第三方供应商分别保存名称、API URL、API Key、配置快照和模型列表。
 - 添加或编辑供应商时探测 Responses、Chat Completions 和 Anthropic Messages 接口，并从 `/v1/models` 读取模型 ID。
-- 将模型 ID 写入 Codex 模型列表，每个条目只包含 `slug` 和 `display_name`。
+- 在供应商卡片中显示从 `/v1/models` 读取到的模型数量。
 - 切换第三方供应商时关闭正在运行的 Codex，并更新当前 `config.toml` 中的以下内容：
 
 ```toml
 model_provider = "custom"
-model_catalog_json = "供应商模型列表路径"
 
 [model_providers.custom]
 name = "供应商名称"
@@ -39,7 +38,7 @@ requires_openai_auth = true
 1. 从 [Releases](../../releases) 下载对应系统的安装包并安装 CSwitch。
 2. 打开 CSwitch。已有有效官方登录时，点击官方登录即可保存并使用；没有有效登录时，按浏览器页面完成登录。
 3. 点击右上角加号，填写供应商名称、API URL 和 API Key。
-4. 保存供应商。CSwitch 会检测接口并同步模型列表。
+4. 保存供应商。CSwitch 会检测接口并读取模型数量。
 5. 点击供应商卡片完成切换。供应商需要协议转换时，先按界面提示启用本地路由。
 6. 点击官方登录卡片即可恢复官方配置和登录状态。
 

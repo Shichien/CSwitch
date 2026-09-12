@@ -490,7 +490,7 @@ mod integration_tests {
                 "openai_chat",
                 "local",
                 Some(&endpoint),
-                |_| Ok(Vec::new()),
+                b"",
             )
             .expect("save provider");
 
