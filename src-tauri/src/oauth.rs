@@ -3,10 +3,12 @@ use chrono::Utc;
 use rand::RngCore;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::env;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,6 +17,10 @@ use url::Url;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
+const ORIGINATOR: &str = "codex_cli_rs";
+// Track openai/codex latest stable: https://github.com/openai/codex/releases/latest
+const CODEX_CLI_VERSION: &str = "0.154.0";
+const LOCAL_NO_PROXY: &str = "localhost,127.0.0.1,::1";
 const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -189,10 +195,24 @@ fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), Box<dyn Error>> {
 }
 
 fn http_client() -> Result<Client, Box<dyn Error>> {
-    Ok(Client::builder()
+    let mut headers = HeaderMap::new();
+    headers.insert("originator", HeaderValue::from_static(ORIGINATOR));
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    let mut builder = Client::builder()
         .timeout(REQUEST_TIMEOUT)
-        .user_agent(concat!("CSwitch/", env!("CARGO_PKG_VERSION")))
-        .build()?)
+        .user_agent(oauth_user_agent())
+        .default_headers(headers);
+    if let Some(proxy_url) = detect_outbound_proxy() {
+        let proxy = reqwest::Proxy::all(&proxy_url)
+            .map_err(|error| format!("系统代理无效（{proxy_url}）：{error}"))?
+            .no_proxy(reqwest::NoProxy::from_string(&no_proxy_list()));
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder.build()?)
+}
+
+fn oauth_user_agent() -> String {
+    format!("{ORIGINATOR}/{CODEX_CLI_VERSION}")
 }
 
 fn refresh_auth_with(
@@ -211,22 +231,23 @@ fn refresh_auth_with(
         return Ok(AuthHealth::Invalid);
     }
 
-    let response = client
-        .post(token_url)
-        .header("Content-Type", "application/json")
-        .json(&json!({
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }))
-        .send()?;
+    let response = post_token_form(
+        client,
+        token_url,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", CLIENT_ID),
+            ("scope", "openid profile email"),
+        ],
+    )?;
     let status = response.status();
     let body = response.bytes()?;
     if !status.is_success() {
         if status == StatusCode::UNAUTHORIZED || is_permanent_refresh_failure(&body) {
             return Ok(AuthHealth::Invalid);
         }
-        return Err(format!("官方登录测活失败，令牌服务返回 {status}").into());
+        return Err(token_service_error("官方登录测活", status, &body).into());
     }
 
     let refreshed: TokenResponse =
@@ -242,21 +263,21 @@ fn exchange_code(
     verifier: &str,
     code: &str,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let response = client
-        .post(token_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&[
+    let response = post_token_form(
+        client,
+        token_url,
+        &[
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("client_id", CLIENT_ID),
             ("code_verifier", verifier),
-        ])
-        .send()?;
+        ],
+    )?;
     let status = response.status();
     let body = response.bytes()?;
     if !status.is_success() {
-        return Err(format!("官方登录令牌交换失败，令牌服务返回 {status}").into());
+        return Err(token_service_error("官方登录令牌交换", status, &body).into());
     }
     let tokens: TokenResponse =
         serde_json::from_slice(&body).map_err(|error| format!("官方登录令牌响应无效：{error}"))?;
@@ -276,6 +297,171 @@ fn exchange_code(
         "last_refresh": Utc::now().to_rfc3339(),
     });
     Ok(serde_json::to_vec_pretty(&auth)?)
+}
+
+fn post_token_form(
+    client: &Client,
+    token_url: &str,
+    fields: &[(&str, &str)],
+) -> Result<reqwest::blocking::Response, Box<dyn Error>> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(fields.iter().copied())
+        .finish();
+    Ok(client
+        .post(token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()?)
+}
+
+fn detect_outbound_proxy() -> Option<String> {
+    const KEYS: [&str; 6] = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ];
+    for key in KEYS {
+        if let Ok(value) = env::var(key)
+            && let Some(url) = normalize_proxy_url(&value)
+        {
+            return Some(url);
+        }
+    }
+    #[cfg(windows)]
+    {
+        windows_system_proxy()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn no_proxy_list() -> String {
+    match env::var("NO_PROXY")
+        .ok()
+        .or_else(|| env::var("no_proxy").ok())
+    {
+        Some(extra) if !extra.trim().is_empty() => format!("{extra},{LOCAL_NO_PROXY}"),
+        _ => LOCAL_NO_PROXY.to_string(),
+    }
+}
+
+fn normalize_proxy_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let url = if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    };
+    let parsed = Url::parse(&url).ok()?;
+    matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h").then_some(url)
+}
+
+fn parse_windows_proxy_server(server: &str) -> Option<String> {
+    let server = server.trim();
+    if server.is_empty() {
+        return None;
+    }
+    if !server.contains('=') {
+        return normalize_proxy_url(server);
+    }
+    let mut http = None;
+    let mut socks = None;
+    for part in server.split(';') {
+        let Some((scheme, address)) = part.split_once('=') else {
+            continue;
+        };
+        let address = address.trim();
+        if address.is_empty() {
+            continue;
+        }
+        match scheme.trim().to_ascii_lowercase().as_str() {
+            "https" => http = normalize_proxy_url(address),
+            "http" if http.is_none() => http = normalize_proxy_url(address),
+            "socks" | "socks5" | "socks5h" => {
+                socks = Some(if address.contains("://") {
+                    address.to_string()
+                } else {
+                    format!("socks5://{address}")
+                })
+            }
+            _ => {}
+        }
+    }
+    http.or(socks)
+}
+
+#[cfg(windows)]
+fn windows_system_proxy() -> Option<String> {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        .ok()?;
+    let enabled: u32 = key.get_value("ProxyEnable").ok()?;
+    if enabled == 0 {
+        return None;
+    }
+    let server: String = key.get_value("ProxyServer").ok()?;
+    parse_windows_proxy_server(&server)
+}
+
+fn token_service_error(action: &str, status: StatusCode, body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    if looks_like_waf(&text) {
+        return format!(
+            "{action}失败，令牌服务返回 {status}。请求很可能被 Cloudflare 拦截；谷歌登录本身可用，请确认 CSwitch 能走系统代理后重试"
+        );
+    }
+    let detail = oauth_error_detail(body);
+    if status == StatusCode::FORBIDDEN {
+        return match detail {
+            Some(detail) => format!(
+                "{action}失败，令牌服务返回 {status}：{detail}。这与用谷歌还是邮箱登录无关，通常是换票请求未走系统代理"
+            ),
+            None => format!(
+                "{action}失败，令牌服务返回 {status}。这与用谷歌还是邮箱登录无关，通常是换票请求未走系统代理"
+            ),
+        };
+    }
+    match detail {
+        Some(detail) => format!("{action}失败，令牌服务返回 {status}：{detail}"),
+        None => format!("{action}失败，令牌服务返回 {status}"),
+    }
+}
+
+fn looks_like_waf(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("just a moment")
+        || lower.contains("cf-mitigated")
+        || lower.contains("attention required")
+        || lower.contains("cloudflare")
+}
+
+fn oauth_error_detail(body: &[u8]) -> Option<String> {
+    let document = serde_json::from_slice::<Value>(body).ok()?;
+    let description = document
+        .get("error_description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let code = document.get("error").and_then(|error| match error {
+        Value::String(code) => Some(code.as_str()),
+        Value::Object(object) => object.get("code").and_then(Value::as_str),
+        _ => None,
+    });
+    match (code, description) {
+        (Some(code), Some(description)) => Some(format!("{code}: {description}")),
+        (None, Some(description)) => Some(description),
+        (Some(code), None) => Some(code.to_string()),
+        (None, None) => None,
+    }
 }
 
 fn required_response_token(value: Option<String>, name: &str) -> Result<String, Box<dyn Error>> {
@@ -520,7 +706,10 @@ mod tests {
         format!("{header}.{payload}.signature")
     }
 
-    fn mock_token_server(status: u16, response: Value) -> (String, thread::JoinHandle<Value>) {
+    fn mock_token_server(
+        status: u16,
+        response: Value,
+    ) -> (String, thread::JoinHandle<HashMap<String, String>>) {
         let server = Server::http("127.0.0.1:0").expect("bind mock server");
         let address = server.server_addr().to_ip().expect("mock address");
         let url = format!("http://{address}/oauth/token");
@@ -542,7 +731,9 @@ mod tests {
                         ),
                 )
                 .expect("respond refresh");
-            serde_json::from_str(&body).expect("parse refresh request")
+            url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>()
         });
         (url, handle)
     }
@@ -610,9 +801,19 @@ mod tests {
         assert_eq!(updated["tokens"]["access_token"], "new-access");
         assert_eq!(updated["tokens"]["refresh_token"], "new-refresh");
         let request = server.join().expect("join mock server");
-        assert_eq!(request["grant_type"], "refresh_token");
-        assert_eq!(request["client_id"], CLIENT_ID);
-        assert_eq!(request["refresh_token"], "old-refresh");
+        assert_eq!(
+            request.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(request.get("client_id").map(String::as_str), Some(CLIENT_ID));
+        assert_eq!(
+            request.get("refresh_token").map(String::as_str),
+            Some("old-refresh")
+        );
+        assert_eq!(
+            request.get("scope").map(String::as_str),
+            Some("openid profile email")
+        );
     }
 
     #[test]
@@ -855,5 +1056,58 @@ mod tests {
         cancel_thread.join().expect("join cancellation thread");
         assert_eq!(error.to_string(), "官方登录已取消");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn token_exchange_forbidden_does_not_blame_google_login() {
+        let (url, server) = mock_token_server(403, json!({"error": "forbidden"}));
+        let client = http_client().expect("http client");
+
+        let error = exchange_code(
+            &client,
+            &url,
+            "http://localhost:1455/auth/callback",
+            "fixture-verifier",
+            "fixture-code",
+        )
+        .expect_err("forbidden exchange");
+        let message = error.to_string();
+        assert!(message.contains("403"));
+        assert!(message.contains("系统代理") || message.contains("谷歌"));
+        server.join().expect("join mock server");
+    }
+
+    #[test]
+    fn waf_challenge_error_does_not_echo_html_or_tokens() {
+        let message = token_service_error(
+            "官方登录令牌交换",
+            StatusCode::FORBIDDEN,
+            b"<html>Just a moment... cloudflare refresh-private-value</html>",
+        );
+        assert!(message.contains("Cloudflare"));
+        assert!(!message.contains("refresh-private-value"));
+        assert!(!message.contains("<html>"));
+    }
+
+    #[test]
+    fn oauth_user_agent_matches_latest_stable_codex_cli() {
+        assert_eq!(oauth_user_agent(), "codex_cli_rs/0.154.0");
+    }
+
+    #[test]
+    fn windows_proxy_server_values_are_normalized() {
+        assert_eq!(
+            parse_windows_proxy_server("127.0.0.1:7890"),
+            Some("http://127.0.0.1:7890".to_string())
+        );
+        assert_eq!(
+            parse_windows_proxy_server("http=127.0.0.1:7890;https=127.0.0.1:7891"),
+            Some("http://127.0.0.1:7891".to_string())
+        );
+        assert_eq!(
+            parse_windows_proxy_server("socks=127.0.0.1:1080"),
+            Some("socks5://127.0.0.1:1080".to_string())
+        );
+        assert_eq!(parse_windows_proxy_server(""), None);
     }
 }
