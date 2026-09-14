@@ -495,7 +495,7 @@ where
             saved_official_auth.as_deref(),
             &target.auth,
         );
-        report_history_stage(progress, 6, TOTAL, config_selects_custom(original_bytes)?);
+        report_history_stage(progress, 6, TOTAL);
         let report = activate_custom(
             codex_home,
             original.as_deref(),
@@ -745,7 +745,7 @@ pub(crate) fn switch_to_official_with_progress(
                 "正在恢复官方 config.toml 和 ChatGPT 登录态。",
             );
             profiles.save_official(&official_config, &official_auth)?;
-            report_history_stage(progress, 6, TOTAL, is_official_config(original_text)?);
+            report_history_stage(progress, 6, TOTAL);
             let report = activate_official(
                 codex_home,
                 original.as_deref(),
@@ -824,27 +824,13 @@ fn capture_official_profile(
     profiles.save_official(config, &auth)
 }
 
-fn report_history_stage(
-    progress: &ProgressReporter,
-    current: u32,
-    total: u32,
-    already_aligned: bool,
-) {
-    if already_aligned {
-        progress.stage(
-            current,
-            total,
-            "跳过会话同步",
-            "当前已是同一 Codex 提供方，不必改写历史对话。",
-        );
-    } else {
-        progress.stage(
-            current,
-            total,
-            "同步会话历史",
-            "正在把会话记录改到当前提供方，文件较多时会多等一会儿。",
-        );
-    }
+fn report_history_stage(progress: &ProgressReporter, current: u32, total: u32) {
+    progress.stage(
+        current,
+        total,
+        "检查会话历史",
+        "正在检查任务提供方，只修改与目标不一致的记录。",
+    );
 }
 
 fn activate_custom(

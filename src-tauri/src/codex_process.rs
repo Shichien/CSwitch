@@ -27,13 +27,19 @@ fn is_codex_desktop_process(name: &str, executable: &Path) -> bool {
         .to_lowercase();
     let lower_name = name.to_lowercase();
 
-    let macos_app = lower_name == "codex" && normalized.contains("/codex.app/contents/macos/codex");
-    let windows_app = lower_name == "codex.exe"
-        && (normalized.contains("/program files/codex/")
-            || normalized.contains("/appdata/local/codex/")
-            || normalized.contains("/appdata/local/programs/codex/")
-            || (normalized.contains("/program files/windowsapps/")
-                && normalized.contains("codex")));
+    let macos_app = (lower_name == "codex"
+        && normalized.contains("/codex.app/contents/macos/codex"))
+        || (lower_name == "chatgpt" && normalized.contains("/chatgpt.app/contents/macos/chatgpt"));
+    let windows_store_app = (lower_name == "codex.exe" || lower_name == "chatgpt.exe")
+        && normalized.contains("/program files/windowsapps/openai.codex_");
+    let windows_app_server =
+        lower_name == "codex.exe" && normalized.contains("/appdata/local/openai/codex/bin/");
+    let windows_app = windows_store_app
+        || windows_app_server
+        || (lower_name == "codex.exe"
+            && (normalized.contains("/program files/codex/")
+                || normalized.contains("/appdata/local/codex/")
+                || normalized.contains("/appdata/local/programs/codex/")));
     let linux_app = (lower_name == "codex" || lower_name == "codex-desktop")
         && (normalized.starts_with("/opt/codex/")
             || normalized.starts_with("/usr/lib/codex/")
@@ -90,14 +96,23 @@ mod platform {
             return Ok(true);
         }
 
+        let mut force_close_errors = Vec::new();
         for process in find_codex_processes()? {
-            let status = Command::new("taskkill")
-                .args(["/PID", &process.pid.to_string(), "/F"])
+            match Command::new("taskkill")
+                .args(["/PID", &process.pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if let Err(error) = status {
-                return Err(format!("结束 Codex 进程 {} 失败：{error}", process.pid).into());
+                .stderr(Stdio::piped())
+                .output()
+            {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => force_close_errors.push(format!(
+                    "进程 {}：{}",
+                    process.pid,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(error) => {
+                    force_close_errors.push(format!("进程 {}：{error}", process.pid));
+                }
             }
         }
         if !wait_until_closed(CLOSE_TIMEOUT)? {
@@ -106,7 +121,12 @@ mod platform {
                 .map(|process| process.pid.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(format!("Codex 仍在运行，进程号：{pids}").into());
+            let details = if force_close_errors.is_empty() {
+                String::new()
+            } else {
+                format!("。系统错误：{}", force_close_errors.join("；"))
+            };
+            return Err(format!("Codex 仍在运行，进程号：{pids}{details}").into());
         }
         Ok(true)
     }
@@ -134,7 +154,7 @@ mod platform {
                 .position(|character| *character == 0)
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-            if name.eq_ignore_ascii_case("Codex.exe")
+            if (name.eq_ignore_ascii_case("Codex.exe") || name.eq_ignore_ascii_case("ChatGPT.exe"))
                 && let Some(executable) = process_image_path(entry.th32ProcessID)
                 && is_codex_desktop_process(&name, &executable)
             {
@@ -229,9 +249,10 @@ mod platform {
             return Ok(false);
         }
 
-        let _ = Command::new("osascript")
-            .args(["-e", "tell application \"Codex\" to quit"])
-            .status();
+        for application in ["Codex", "ChatGPT"] {
+            let script = format!("tell application \"{application}\" to quit");
+            let _ = Command::new("osascript").args(["-e", &script]).status();
+        }
         if wait_until_closed(CLOSE_TIMEOUT)? {
             return Ok(true);
         }
@@ -248,24 +269,26 @@ mod platform {
     }
 
     fn find_codex_processes() -> Result<Vec<u32>, Box<dyn Error>> {
-        let output = Command::new("pgrep").args(["-x", "Codex"]).output()?;
-        if output.status.code() == Some(1) {
-            return Ok(Vec::new());
-        }
-        if !output.status.success() {
-            return Err(format!("读取 macOS 进程列表失败：{}", output.status).into());
-        }
         let mut found = Vec::new();
-        for line in String::from_utf8(output.stdout)?.lines() {
-            let pid = line.trim().parse::<u32>()?;
-            let command = Command::new("ps")
-                .args(["-p", &pid.to_string(), "-o", "command="])
-                .output()?;
-            let executable = String::from_utf8(command.stdout)?;
-            if command.status.success()
-                && is_codex_desktop_process("Codex", Path::new(executable.trim()))
-            {
-                found.push(pid);
+        for name in ["Codex", "ChatGPT"] {
+            let output = Command::new("pgrep").args(["-x", name]).output()?;
+            if output.status.code() == Some(1) {
+                continue;
+            }
+            if !output.status.success() {
+                return Err(format!("读取 macOS 进程列表失败：{}", output.status).into());
+            }
+            for line in String::from_utf8(output.stdout)?.lines() {
+                let pid = line.trim().parse::<u32>()?;
+                let command = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "command="])
+                    .output()?;
+                let executable = String::from_utf8(command.stdout)?;
+                if command.status.success()
+                    && is_codex_desktop_process(name, Path::new(executable.trim()))
+                {
+                    found.push(pid);
+                }
             }
         }
         Ok(found)
@@ -378,8 +401,22 @@ mod tests {
             Path::new("/Applications/Codex.app/Contents/MacOS/Codex")
         ));
         assert!(is_codex_desktop_process(
+            "ChatGPT",
+            Path::new("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
+        ));
+        assert!(is_codex_desktop_process(
             "Codex.exe",
             Path::new(r"C:\Users\fixture\AppData\Local\Programs\Codex\Codex.exe")
+        ));
+        assert!(is_codex_desktop_process(
+            "ChatGPT.exe",
+            Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.908.4834.0_x64__fixture\app\ChatGPT.exe"
+            )
+        ));
+        assert!(is_codex_desktop_process(
+            "codex.exe",
+            Path::new(r"C:\Users\fixture\AppData\Local\OpenAI\Codex\bin\build\codex.exe")
         ));
         assert!(is_codex_desktop_process(
             "codex-desktop",
@@ -394,8 +431,18 @@ mod tests {
             Path::new(r"C:\Program Files\Codex\QuotaPlusPlus.exe")
         ));
         assert!(!is_codex_desktop_process(
+            "ChatGPT.exe",
+            Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.0.0.0_x64__fixture\app\ChatGPT.exe"
+            )
+        ));
+        assert!(!is_codex_desktop_process(
             "CSwitch",
             Path::new("/Applications/Codex.app/Contents/MacOS/CSwitch")
+        ));
+        assert!(!is_codex_desktop_process(
+            "ChatGPT",
+            Path::new("/Applications/ChatGPT Classic.app/Contents/MacOS/ChatGPT")
         ));
     }
 

@@ -1,7 +1,7 @@
 use chrono::Local;
 use fs2::FileExt;
 use rusqlite::backup::Backup;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -225,37 +225,37 @@ where
             return Err(format!("读取 {} 失败：{error}", auth_path.display()).into());
         }
     };
-    let skip_history = live_provider_id(original_config).as_deref() == Some(target_provider);
     let config_unchanged = original_config.is_some_and(|content| content == updated_config);
     let auth_unchanged = match auth_update {
         AuthUpdate::Keep => true,
         AuthUpdate::Replace(auth) => original_auth.as_deref() == Some(auth),
     };
-    if skip_history && config_unchanged && auth_unchanged {
-        before_config_write()?;
-        return Ok(unchanged_sync_report());
-    }
-
-    let changes = if skip_history {
-        Vec::new()
-    } else {
-        collect_rollout_changes(codex_home, target_provider)?
-    };
-    let state_db = if skip_history {
-        None
-    } else {
-        resolve_state_db(codex_home)?
-    };
-    if let Some(path) = state_db.as_deref() {
-        assert_sqlite_writable(path)?;
-    }
+    let changes = collect_rollout_changes(codex_home, target_provider)?;
+    let state_db = resolve_state_db(codex_home)?;
     let sqlite_counts = match state_db.as_deref() {
-        Some(path) => read_sqlite_provider_counts(path)?,
+        Some(path) => match read_sqlite_provider_counts(path) {
+            Ok(counts) => counts,
+            Err(error) if is_sqlite_busy(error.as_ref()) => {
+                return Err(format!(
+                    "state_5.sqlite 正在使用，请关闭 Codex 后重试 {}：{error}",
+                    path.display()
+                )
+                .into());
+            }
+            Err(error) => return Err(error),
+        },
         None => BTreeMap::new(),
     };
     let sqlite_needs_update = sqlite_counts
         .iter()
         .any(|(provider, count)| provider.as_str() != target_provider && *count > 0);
+    if changes.is_empty() && !sqlite_needs_update && config_unchanged && auth_unchanged {
+        before_config_write()?;
+        return Ok(unchanged_sync_report());
+    }
+    if sqlite_needs_update && let Some(path) = state_db.as_deref() {
+        assert_sqlite_writable(path)?;
+    }
     let sqlite_backup = if sqlite_needs_update {
         state_db.clone()
     } else {
@@ -392,23 +392,6 @@ fn unchanged_sync_report() -> ProviderSyncReport {
         providers_detected: Vec::new(),
         backup_path: String::new(),
     }
-}
-
-fn live_provider_id(config: Option<&[u8]>) -> Option<String> {
-    let bytes = config.unwrap_or(b"");
-    if bytes.is_empty() {
-        return Some("openai".to_string());
-    }
-    let text = std::str::from_utf8(bytes).ok()?;
-    let document: toml_edit::DocumentMut = text.parse().ok()?;
-    Some(
-        document
-            .get("model_provider")
-            .and_then(toml_edit::Item::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("openai")
-            .to_string(),
-    )
 }
 
 fn finish_failed_transaction<T>(
@@ -899,6 +882,18 @@ fn read_sqlite_provider_counts(path: &Path) -> Result<BTreeMap<String, usize>, B
         counts.insert(provider, usize::try_from(count)?);
     }
     Ok(counts)
+}
+
+fn is_sqlite_busy(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                rusqlite::Error::SqliteFailure(code, _)
+                    if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            )
+        })
 }
 
 fn assert_sqlite_writable(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -1395,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_history_when_live_provider_already_matches() {
+    fn repairs_history_when_live_config_already_matches() {
         let directory = tempdir().expect("tempdir");
         let codex_home = directory.path();
         let rollout = codex_home.join("sessions/rollout-already-custom.jsonl");
@@ -1404,7 +1399,6 @@ mod tests {
             Some("openai"),
             r#"{"type":"event_msg","payload":{"message":"leave me"}}"#,
         );
-        let original_rollout = fs::read(&rollout).expect("read rollout");
         let state_db = codex_home.join("sqlite/state_5.sqlite");
         create_state_db(&state_db, &[Some("openai")]);
         let original = b"model_provider = \"custom\"\nmodel = \"keep\"\n";
@@ -1414,30 +1408,31 @@ mod tests {
         let report =
             apply_provider_config(codex_home, Some(original), updated, "custom").expect("sync");
 
-        assert_eq!(report.rollout_files_updated, 0);
-        assert_eq!(report.sqlite_rows_updated, 0);
-        assert_eq!(
-            fs::read(&rollout).expect("read rollout after skip"),
-            original_rollout
+        assert_eq!(report.rollout_files_updated, 1);
+        assert_eq!(report.sqlite_rows_updated, 1);
+        assert!(
+            fs::read_to_string(&rollout)
+                .expect("read repaired rollout")
+                .contains(r#""model_provider":"custom""#)
         );
-        let remaining: i64 = Connection::open(&state_db)
+        let repaired: i64 = Connection::open(&state_db)
             .expect("open db")
             .query_row(
-                "SELECT COUNT(*) FROM threads WHERE model_provider = 'openai'",
+                "SELECT COUNT(*) FROM threads WHERE model_provider = 'custom'",
                 [],
                 |row| row.get(0),
             )
-            .expect("count openai threads");
-        assert_eq!(remaining, 1);
+            .expect("count custom threads");
+        assert_eq!(repaired, 1);
         assert_eq!(
             fs::read(codex_home.join("config.toml")).expect("read config"),
             updated
         );
         assert!(Path::new(&report.backup_path).join("config.toml").is_file());
         assert!(
-            !Path::new(&report.backup_path)
+            Path::new(&report.backup_path)
                 .join("sqlite/state_5.sqlite")
-                .exists()
+                .is_file()
         );
     }
 
@@ -1449,7 +1444,7 @@ mod tests {
         fs::write(codex_home.join("config.toml"), original).expect("write config");
         create_rollout(
             &codex_home.join("sessions/rollout-skip.jsonl"),
-            Some("openai"),
+            Some("custom"),
             r#"{"type":"event_msg","payload":{"message":"ignored"}}"#,
         );
 
