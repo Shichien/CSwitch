@@ -37,9 +37,15 @@ struct AnthropicStream {
     stop_reason: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ConversionContext {
     custom_tools: HashSet<String>,
+}
+
+impl ConversionContext {
+    pub(crate) fn is_custom(&self, name: &str) -> bool {
+        self.custom_tools.contains(name)
+    }
 }
 
 pub(crate) struct ConvertedRequest {
@@ -51,6 +57,7 @@ pub(crate) fn convert_request(
     protocol: &str,
     body: &Value,
 ) -> Result<ConvertedRequest, Box<dyn Error>> {
+    validate_convertible_input(body)?;
     let mut body = body.clone();
     sanitize_responses_body(&mut body);
     let context = conversion_context(&body);
@@ -63,6 +70,59 @@ pub(crate) fn convert_request(
         body: converted,
         context,
     })
+}
+
+fn validate_convertible_input(body: &Value) -> Result<(), Box<dyn Error>> {
+    for field in ["previous_response_id", "conversation"] {
+        if body.get(field).is_some_and(|v| !v.is_null()) {
+            return Err(format!("本地协议转换需要完整对话，暂不接受 {field}").into());
+        }
+    }
+    for tool in body["tools"].as_array().into_iter().flatten() {
+        let kind = tool["type"].as_str().unwrap_or("(missing)");
+        if !matches!(kind, "function" | "custom") {
+            return Err(format!("本地协议转换尚未支持工具类型 {kind}，请求已停止").into());
+        }
+    }
+    for item in body["input"].as_array().into_iter().flatten() {
+        let kind = item["type"].as_str().unwrap_or("message");
+        if !matches!(
+            kind,
+            "message"
+                | "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
+                | "reasoning"
+        ) {
+            return Err(format!("本地协议转换尚未支持输入类型 {kind}").into());
+        }
+        for part in item["content"].as_array().into_iter().flatten() {
+            let kind = part["type"].as_str().unwrap_or("(missing)");
+            if kind == "input_image" {
+                let url = part
+                    .get("image_url")
+                    .or_else(|| part.get("url"))
+                    .and_then(Value::as_str)
+                    .ok_or("图片输入需要网址或内联数据，当前路由尚未支持 file_id")?;
+                if !(url.starts_with("http://")
+                    || url.starts_with("https://")
+                    || (url.starts_with("data:image/") && url.contains(";base64,")))
+                {
+                    return Err("图片地址格式不受当前路由支持".into());
+                }
+            }
+            if !matches!(kind, "input_text" | "output_text" | "input_image") {
+                return Err(format!("本地协议转换尚未支持内容类型 {kind}").into());
+            }
+        }
+        for part in item["output"].as_array().into_iter().flatten() {
+            if !part.is_string() && part.get("text").is_none() {
+                return Err("工具结果包含非文本内容，当前路由尚未支持该内容类型".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn sanitize_responses_body(body: &mut Value) {
@@ -252,7 +312,16 @@ fn responses_to_chat(body: &Value) -> Result<Value, Box<dyn Error>> {
         }
     }
     if let Some(format) = body.pointer("/text/format") {
-        result["response_format"] = format.clone();
+        result["response_format"] = if format["type"] == "json_schema" {
+            let mut schema = format.clone();
+            schema
+                .as_object_mut()
+                .ok_or("JSON Schema 格式无效")?
+                .remove("type");
+            json!({"type":"json_schema", "json_schema":schema})
+        } else {
+            format.clone()
+        };
     }
     if let Some(effort) = body.pointer("/reasoning/effort") {
         result["reasoning_effort"] = effort.clone();
@@ -425,6 +494,7 @@ fn chat_tool_to_response(
 
 fn responses_to_anthropic(body: &Value) -> Result<Value, Box<dyn Error>> {
     let mut messages = Vec::new();
+    let mut system_parts = Vec::new();
     let mut assistant_blocks = Vec::new();
     match body.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
@@ -437,10 +507,15 @@ fn responses_to_anthropic(body: &Value) -> Result<Value, Box<dyn Error>> {
                 {
                     "message" => {
                         flush_anthropic_assistant(&mut messages, &mut assistant_blocks);
-                        messages.push(json!({
-                            "role": item.get("role").cloned().unwrap_or_else(|| json!("user")),
-                            "content": response_content_to_anthropic(item.get("content"))
-                        }));
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        if matches!(role, "system" | "developer") {
+                            system_parts
+                                .push(content_text(item.get("content").unwrap_or(&Value::Null)));
+                        } else if matches!(role, "user" | "assistant") {
+                            messages.push(json!({"role":role,"content":response_content_to_anthropic(item.get("content"))}));
+                        } else {
+                            return Err(format!("Anthropic 消息角色无效：{role}").into());
+                        }
                     }
                     "function_call" | "custom_tool_call" => {
                         let input = item.get("input").cloned();
@@ -465,14 +540,52 @@ fn responses_to_anthropic(body: &Value) -> Result<Value, Box<dyn Error>> {
         _ => {}
     }
     flush_anthropic_assistant(&mut messages, &mut assistant_blocks);
+    // Combine adjacent user/tool-result messages so parallel tool results belong to one turn.
+    let mut merged: Vec<Value> = Vec::new();
+    for mut message in messages {
+        if let Some(text) = message["content"].as_str() {
+            message["content"] = json!([{"type":"text","text":text}]);
+        }
+        if let Some(last) = merged.last_mut()
+            && last["role"] == message["role"]
+        {
+            last["content"]
+                .as_array_mut()
+                .ok_or("消息内容应为数组")?
+                .extend(
+                    message["content"]
+                        .as_array()
+                        .ok_or("消息内容应为数组")?
+                        .iter()
+                        .cloned(),
+                );
+        } else {
+            merged.push(message);
+        }
+    }
     let mut result = json!({
         "model": body.get("model").cloned().unwrap_or(Value::Null),
-        "messages": messages,
-        "max_tokens": body.get("max_output_tokens").cloned().unwrap_or_else(|| json!(4096)),
+        "messages": merged,
+        "max_tokens": body.get("max_output_tokens").filter(|value| value.as_u64().is_some_and(|n| n > 0)).cloned().ok_or("Anthropic Messages 必须提供 max_output_tokens；CSwitch 不猜测模型输出上限")?,
         "stream": body.get("stream").and_then(Value::as_bool).unwrap_or(false)
     });
     if let Some(instructions) = body.get("instructions") {
-        result["system"] = instructions.clone();
+        system_parts.insert(0, content_text(instructions));
+    }
+    if !system_parts.is_empty() {
+        result["system"] = json!(system_parts.join("\n\n"));
+    }
+    if body
+        .pointer("/text/format/type")
+        .is_some_and(|value| value != "text")
+    {
+        return Err("当前 Anthropic 路由尚未实现结构化输出，请使用原生 Responses 供应商".into());
+    }
+    if body
+        .pointer("/reasoning/effort")
+        .is_some_and(|value| value != "none")
+    {
+        return Err("当前 Anthropic 路由尚未实现思考参数映射，请使用原生 Responses 供应商".into());
     }
     for field in ["temperature", "top_p"] {
         if let Some(value) = body.get(field) {
@@ -493,6 +606,9 @@ fn responses_to_anthropic(body: &Value) -> Result<Value, Box<dyn Error>> {
         result["tools"] = Value::Array(tools);
         if let Some(choice) = body.get("tool_choice") {
             result["tool_choice"] = response_tool_choice_to_anthropic(choice);
+            if body["parallel_tool_calls"] == false && result["tool_choice"]["type"] != "none" {
+                result["tool_choice"]["disable_parallel_tool_use"] = json!(true);
+            }
         }
     }
     Ok(result)
@@ -531,6 +647,9 @@ fn image_to_anthropic(part: &Value) -> Option<Value> {
         .get("image_url")
         .or_else(|| part.get("url"))?
         .as_str()?;
+    if url.starts_with("https://") || url.starts_with("http://") {
+        return Some(json!({"type":"image","source":{"type":"url","url":url}}));
+    }
     let data = url.strip_prefix("data:")?;
     let (media_type, encoded) = data.split_once(";base64,")?;
     Some(
@@ -566,7 +685,7 @@ fn response_tool_choice_to_anthropic(choice: &Value) -> Value {
     } else {
         match choice.as_str() {
             Some("required") => json!({"type": "any"}),
-            Some("none") => Value::Null,
+            Some("none") => json!({"type":"none"}),
             _ => json!({"type": "auto"}),
         }
     }
@@ -621,7 +740,7 @@ fn chat_stream_to_response(
     context: &ConversionContext,
 ) -> Result<Value, Box<dyn Error>> {
     let mut stream = ChatStream::default();
-    for value in sse_values(body) {
+    for value in sse_values(body)? {
         if let Some(id) = value.get("id").and_then(Value::as_str) {
             stream.id = Some(id.to_string());
         }
@@ -681,7 +800,7 @@ fn anthropic_stream_to_response(
     context: &ConversionContext,
 ) -> Result<Value, Box<dyn Error>> {
     let mut stream = AnthropicStream::default();
-    for value in sse_values(body) {
+    for value in sse_values(body)? {
         if let Some(message) = value.get("message") {
             stream.id = message
                 .get("id")
@@ -901,8 +1020,12 @@ pub(crate) fn response_to_sse(response: &Value) -> Result<Vec<u8>, Box<dyn Error
     }
     push_sse(
         &mut events,
-        "response.completed",
-        json!({"type": "response.completed", "sequence_number": sequence, "response": response}),
+        if response["status"] == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        },
+        json!({"type": if response["status"] == "incomplete" { "response.incomplete" } else { "response.completed" }, "sequence_number": sequence, "response": response}),
     )?;
     Ok(events)
 }
@@ -924,7 +1047,7 @@ fn push_message(output: &mut Vec<Value>, content: Option<&Value>) {
     }
 }
 
-fn chat_usage(usage: Option<&Value>) -> Value {
+pub(crate) fn chat_usage(usage: Option<&Value>) -> Value {
     let usage = usage.unwrap_or(&Value::Null);
     let input = usage
         .get("prompt_tokens")
@@ -945,10 +1068,14 @@ fn chat_usage(usage: Option<&Value>) -> Value {
     json!({"input_tokens": input, "input_tokens_details": {"cached_tokens": cached}, "output_tokens": output, "output_tokens_details": {"reasoning_tokens": reasoning}, "total_tokens": usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(input + output)})
 }
 
-fn anthropic_usage(usage: Option<&Value>) -> Value {
+pub(crate) fn anthropic_usage(usage: Option<&Value>) -> Value {
     let usage = usage.unwrap_or(&Value::Null);
     let input = usage
         .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let created = usage
+        .get("cache_creation_input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let cached = usage
@@ -959,7 +1086,7 @@ fn anthropic_usage(usage: Option<&Value>) -> Value {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    json!({"input_tokens": input + cached, "input_tokens_details": {"cached_tokens": cached}, "output_tokens": output, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": input + cached + output})
+    json!({"input_tokens": input + cached + created, "input_tokens_details": {"cached_tokens": cached}, "output_tokens": output, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": input + cached + created + output})
 }
 
 fn merge_usage(target: &mut Map<String, Value>, usage: Option<&Value>) {
@@ -970,13 +1097,33 @@ fn merge_usage(target: &mut Map<String, Value>, usage: Option<&Value>) {
     }
 }
 
-fn sse_values(body: &str) -> Vec<Value> {
-    body.lines()
-        .filter_map(|line| line.trim().strip_prefix("data:"))
-        .map(str::trim)
-        .filter(|data| !data.is_empty() && *data != "[DONE]")
-        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
-        .collect()
+fn sse_values(body: &str) -> Result<Vec<Value>, Box<dyn Error>> {
+    let mut decoder = crate::sse::Decoder::default();
+    let values = decoder
+        .push(body.as_bytes())
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    decoder
+        .finish()
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    let complete = values.iter().any(|value| {
+        value["cswitch_done"] == true
+            || value["type"] == "message_stop"
+            || value["choices"].as_array().is_some_and(|choices| {
+                choices
+                    .iter()
+                    .any(|choice| choice["finish_reason"].is_string())
+            })
+    });
+    if !complete {
+        return Err("上游流缺少结束事件，响应已截断".into());
+    }
+    if values
+        .iter()
+        .any(|value| value.get("error").is_some() || value["type"] == "error")
+    {
+        return Err("上游流包含错误事件".into());
+    }
+    Ok(values)
 }
 
 fn append_content(target: &mut String, value: Option<&Value>) {
@@ -1089,7 +1236,7 @@ mod tests {
 
     #[test]
     fn anthropic_request_maps_tool_use_and_tool_result() {
-        let converted = responses_to_anthropic(&json!({"model": "fixture-model", "input": [{"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{\"command\":\"pwd\"}"}, {"type": "function_call_output", "call_id": "call_1", "output": "done"}], "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}]})).unwrap();
+        let converted = responses_to_anthropic(&json!({"max_output_tokens": 2048, "model": "fixture-model", "input": [{"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{\"command\":\"pwd\"}"}, {"type": "function_call_output", "call_id": "call_1", "output": "done"}], "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}]})).unwrap();
         assert_eq!(converted["messages"][0]["content"][0]["type"], "tool_use");
         assert_eq!(
             converted["messages"][1]["content"][0]["type"],
@@ -1137,6 +1284,8 @@ mod tests {
             "tools": [{"type": "custom", "name": "apply_patch"}],
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "edit"}]}]
         });
+        let mut request = request;
+        request["max_output_tokens"] = json!(2048);
         let converted = convert_request("anthropic_messages", &request).unwrap();
         assert_eq!(converted.body["tools"][0]["name"], "apply_patch");
         assert_eq!(
@@ -1235,5 +1384,38 @@ mod tests {
         assert_eq!(input[1]["id"], "rs_ok");
         assert_eq!(input[1]["summary"], json!([]));
         assert_eq!(input[2]["type"], "message");
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn regression_rejects_truncated_stream() {
+        let body = "data: {\"id\":\"chat_test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        assert!(
+            convert_response(
+                "openai_chat",
+                "text/event-stream",
+                body.as_bytes(),
+                &ConversionContext::default()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn regression_rejects_unsupported_tools() {
+        assert!(
+            convert_request(
+                "openai_chat",
+                &json!({"input":"hello", "tools":[{"type":"web_search"}]})
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn regression_json_schema_is_nested_for_chat() {
+        let req=convert_request("openai_chat", &json!({"input":"hello", "text":{"format":{"type":"json_schema", "name":"result", "strict":true, "schema":{"type":"object"}}}})).unwrap();
+        assert_eq!(req.body["response_format"]["json_schema"]["name"], "result");
     }
 }

@@ -5,11 +5,13 @@ mod desktop;
 mod gateway;
 mod gateway_transform;
 mod model_catalog;
+mod network;
 mod oauth;
 mod operation_lock;
 mod profiles;
 mod progress;
 mod provider_sync;
+mod sse;
 mod tray;
 mod upstream;
 

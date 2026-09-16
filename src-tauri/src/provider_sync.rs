@@ -12,7 +12,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 const BACKUP_DIR: &str = "cswitch-backups";
 const TRANSACTION_FILE: &str = "cswitch-sync-transaction.json";
@@ -39,6 +39,7 @@ pub struct ProviderSyncReport {
     pub sqlite_rows_updated: usize,
     pub providers_detected: Vec<ProviderCount>,
     pub backup_path: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -48,16 +49,6 @@ struct RolloutChange {
     separator: String,
     updated_first_line: String,
     original_provider: String,
-}
-
-#[derive(Debug)]
-struct StateDbCandidateStats {
-    path: PathBuf,
-    priority: usize,
-    thread_count: i64,
-    max_thread_timestamp_ms: i64,
-    modified_at: SystemTime,
-    rollout_distance: i64,
 }
 
 #[derive(Serialize)]
@@ -81,6 +72,18 @@ struct RecoveryManifest {
     auth_present: bool,
     sqlite_path: Option<String>,
     rollout_files: Vec<RecoveryRolloutEntry>,
+    #[serde(default)]
+    settings_managed: bool,
+    #[serde(default)]
+    settings_present: bool,
+    #[serde(default)]
+    target_provider: Option<String>,
+    #[serde(default)]
+    checked_files: bool,
+    #[serde(default)]
+    auth_replaced: bool,
+    #[serde(default)]
+    extra_sqlite_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +215,48 @@ fn apply_provider_config_with_hook<F>(
 where
     F: FnOnce() -> Result<(), Box<dyn Error>>,
 {
+    apply_provider_config_with_settings_and_hook(
+        codex_home,
+        original_config,
+        updated_config,
+        target_provider,
+        auth_update,
+        None,
+        before_config_write,
+    )
+}
+
+pub fn apply_provider_state_with_settings(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    updated_config: &[u8],
+    target_provider: &str,
+    auth_update: AuthUpdate<'_>,
+    settings: Option<&[u8]>,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    apply_provider_config_with_settings_and_hook(
+        codex_home,
+        original_config,
+        updated_config,
+        target_provider,
+        auth_update,
+        settings,
+        || Ok(()),
+    )
+}
+
+fn apply_provider_config_with_settings_and_hook<F>(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    updated_config: &[u8],
+    target_provider: &str,
+    auth_update: AuthUpdate<'_>,
+    settings: Option<&[u8]>,
+    before_config_write: F,
+) -> Result<ProviderSyncReport, Box<dyn Error>>
+where
+    F: FnOnce() -> Result<(), Box<dyn Error>>,
+{
     fs::create_dir_all(codex_home).map_err(|error| -> Box<dyn Error> {
         format!("创建 Codex 目录失败 {}：{error}", codex_home.display()).into()
     })?;
@@ -225,6 +270,27 @@ where
             return Err(format!("读取 {} 失败：{error}", auth_path.display()).into());
         }
     };
+    let settings_path = codex_home.join("cswitch-profiles/settings.json");
+    let original_settings = if settings.is_some() {
+        match fs::read(&settings_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!("读取设置失败 {}：{error}", settings_path.display()).into());
+            }
+        }
+    } else {
+        None
+    };
+    let settings_unchanged = settings.is_none() || settings == original_settings.as_deref();
+    let live_config = match fs::read(codex_home.join("config.toml")) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if live_config.as_deref() != original_config {
+        return Err("config.toml 在读取后发生变化，请重新切换".into());
+    }
     let config_unchanged = original_config.is_some_and(|content| content == updated_config);
     let auth_unchanged = match auth_update {
         AuthUpdate::Keep => true,
@@ -232,7 +298,12 @@ where
     };
     let changes = collect_rollout_changes(codex_home, target_provider)?;
     let state_db = resolve_state_db(codex_home)?;
-    let sqlite_counts = match state_db.as_deref() {
+    // Both layouts can coexist across desktop/CLI versions. Synchronize both; never guess the active file.
+    let extra_databases = state_databases(codex_home)?
+        .into_iter()
+        .filter(|path| Some(path) != state_db.as_ref())
+        .collect::<Vec<_>>();
+    let mut sqlite_counts = match state_db.as_deref() {
         Some(path) => match read_sqlite_provider_counts(path) {
             Ok(counts) => counts,
             Err(error) if is_sqlite_busy(error.as_ref()) => {
@@ -246,15 +317,30 @@ where
         },
         None => BTreeMap::new(),
     };
+    for path in &extra_databases {
+        for (provider, count) in read_sqlite_provider_counts(path)
+            .map_err(|error| format!("读取 SQLite 失败 {}：{error}", path.display()))?
+        {
+            *sqlite_counts.entry(provider).or_default() += count;
+        }
+    }
     let sqlite_needs_update = sqlite_counts
         .iter()
         .any(|(provider, count)| provider.as_str() != target_provider && *count > 0);
-    if changes.is_empty() && !sqlite_needs_update && config_unchanged && auth_unchanged {
+    if changes.is_empty()
+        && !sqlite_needs_update
+        && config_unchanged
+        && auth_unchanged
+        && settings_unchanged
+    {
         before_config_write()?;
         return Ok(unchanged_sync_report());
     }
     if sqlite_needs_update && let Some(path) = state_db.as_deref() {
         assert_sqlite_writable(path)?;
+        for path in &extra_databases {
+            assert_sqlite_writable(path)?;
+        }
     }
     let sqlite_backup = if sqlite_needs_update {
         state_db.clone()
@@ -262,6 +348,36 @@ where
         None
     };
 
+    let largest = changes
+        .iter()
+        .map(|change| fs::metadata(&change.path).map(|meta| meta.len()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let database_size = extra_databases
+        .iter()
+        .map(|path| fs::metadata(path).map(|meta| meta.len()))
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .sum::<u64>()
+        + sqlite_backup
+            .as_ref()
+            .map(fs::metadata)
+            .transpose()?
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+    let required = largest
+        .saturating_mul(2)
+        .saturating_add(database_size)
+        .saturating_add(1024 * 1024);
+    let free = fs2::available_space(codex_home)?;
+    if free < required {
+        return Err(format!(
+            "磁盘空间不足：同步与恢复至少需要 {required} 字节，当前可用 {free} 字节"
+        )
+        .into());
+    }
     let providers_detected = merge_provider_counts(&changes, &sqlite_counts);
     let backup_dir = create_backup(
         codex_home,
@@ -272,7 +388,47 @@ where
         &providers_detected,
         target_provider,
     )?;
-    prune_backups(codex_home, &backup_dir)?;
+    if sqlite_needs_update {
+        for (index, path) in extra_databases.iter().enumerate() {
+            backup_sqlite(
+                path,
+                &backup_dir
+                    .join("sqlite")
+                    .join(format!("extra-{index}.sqlite")),
+            )?;
+        }
+    }
+    if settings.is_some() {
+        if let Some(bytes) = original_settings.as_deref() {
+            write_new_file(&backup_dir.join("settings.json"), bytes)?;
+        }
+        let manifest_path = backup_dir.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        manifest["settingsManaged"] = Value::Bool(true);
+        manifest["settingsPresent"] = Value::Bool(original_settings.is_some());
+        atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
+    }
+    // Persist intended bytes before publishing the journal, so recovery can detect later user edits.
+    write_new_file(&backup_dir.join("config.applied.toml"), updated_config)?;
+    if let AuthUpdate::Replace(auth) = auth_update {
+        write_new_file(&backup_dir.join("auth.applied.json"), auth)?;
+    }
+    if let Some(bytes) = settings {
+        write_new_file(&backup_dir.join("settings.applied.json"), bytes)?;
+    }
+    let manifest_path = backup_dir.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    manifest["extraSqlitePaths"] = serde_json::to_value(if sqlite_needs_update {
+        extra_databases
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    })?;
+    manifest["checkedFiles"] = Value::Bool(true);
+    manifest["authReplaced"] = Value::Bool(matches!(auth_update, AuthUpdate::Replace(_)));
+    atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
     let mut journal = begin_transaction(codex_home, &backup_dir)?;
 
     let config_path = codex_home.join("config.toml");
@@ -280,6 +436,7 @@ where
     let mut sqlite_mutated = false;
     let mut config_written = false;
     let mut auth_mutated = false;
+    let mut settings_mutated = false;
 
     let result = (|| -> Result<ProviderSyncReport, Box<dyn Error>> {
         for (index, change) in changes.iter().enumerate() {
@@ -297,7 +454,11 @@ where
             match state_db.as_deref() {
                 Some(path) => {
                     sqlite_mutated = true;
-                    update_sqlite_provider(path, target_provider)?
+                    let mut rows = update_sqlite_provider(path, target_provider)?;
+                    for path in &extra_databases {
+                        rows += update_sqlite_provider(path, target_provider)?;
+                    }
+                    rows
                 }
                 None => 0,
             }
@@ -306,6 +467,7 @@ where
         };
 
         before_config_write()?;
+        ensure_file_unchanged(&config_path, original_config)?;
         if !config_unchanged {
             config_written = true;
             atomic_write(&config_path, updated_config)?;
@@ -317,8 +479,14 @@ where
         verify_applied_rollouts(&changes)?;
         if sqlite_needs_update && let Some(path) = state_db.as_deref() {
             verify_sqlite_provider(path, target_provider)?;
+            for path in &extra_databases {
+                verify_sqlite_provider(path, target_provider)?;
+            }
         }
 
+        if matches!(auth_update, AuthUpdate::Replace(_)) {
+            ensure_file_unchanged(&auth_path, original_auth.as_deref())?;
+        }
         match auth_update {
             AuthUpdate::Keep => {}
             AuthUpdate::Replace(_) if auth_unchanged => {}
@@ -331,7 +499,18 @@ where
             }
         }
 
+        if settings.is_some() {
+            ensure_file_unchanged(&settings_path, original_settings.as_deref())?;
+        }
+        if !settings_unchanged && let Some(bytes) = settings {
+            settings_mutated = true;
+            atomic_write(&settings_path, bytes)?;
+            if fs::read(&settings_path)? != bytes {
+                return Err("settings.json 写后校验失败".into());
+            }
+        }
         Ok(ProviderSyncReport {
+            warnings: Vec::new(),
             rollout_files_updated: changes.len(),
             sqlite_rows_updated,
             providers_detected,
@@ -340,10 +519,10 @@ where
     })();
 
     match result {
-        Ok(report) => {
+        Ok(mut report) => {
             journal.phase = TransactionPhase::Committed;
             if let Err(error) = write_transaction_journal(codex_home, &journal) {
-                let rollback_errors = rollback(
+                let mut rollback_errors = rollback(
                     &config_path,
                     original_config,
                     &auth_path,
@@ -356,6 +535,12 @@ where
                     &changes,
                     &applied_rollouts,
                 );
+                if settings_mutated
+                    && let Err(error) =
+                        restore_optional_file(&settings_path, original_settings.as_deref())
+                {
+                    rollback_errors.push(format!("恢复设置失败：{error}"));
+                }
                 return finish_failed_transaction(
                     codex_home,
                     format!("无法提交同步事务：{error}"),
@@ -363,11 +548,20 @@ where
                     &backup_dir,
                 );
             }
-            clear_transaction_journal(codex_home)?;
+            if let Err(error) = clear_transaction_journal(codex_home) {
+                report
+                    .warnings
+                    .push(format!("切换已完成，事务清理待下次重试：{error}"));
+            }
+            if let Err(error) = prune_backups(codex_home, &backup_dir) {
+                report
+                    .warnings
+                    .push(format!("切换已完成，旧备份清理失败：{error}"));
+            }
             Ok(report)
         }
         Err(error) => {
-            let rollback_errors = rollback(
+            let mut rollback_errors = rollback(
                 &config_path,
                 original_config,
                 &auth_path,
@@ -380,6 +574,12 @@ where
                 &changes,
                 &applied_rollouts,
             );
+            if settings_mutated
+                && let Err(error) =
+                    restore_optional_file(&settings_path, original_settings.as_deref())
+            {
+                rollback_errors.push(format!("恢复设置失败：{error}"));
+            }
             finish_failed_transaction(codex_home, error.to_string(), rollback_errors, &backup_dir)
         }
     }
@@ -391,6 +591,7 @@ fn unchanged_sync_report() -> ProviderSyncReport {
         sqlite_rows_updated: 0,
         providers_detected: Vec::new(),
         backup_path: String::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -441,8 +642,7 @@ fn acquire_sync_lock_file(path: &Path) -> Result<File, Box<dyn Error>> {
         })?;
     file.try_lock_exclusive()
         .map_err(|error| -> Box<dyn Error> {
-            format!("另一个 CSwitch 或 QuotaPlusPlus 同步正在进行，请等待其完成后重试：{error}")
-                .into()
+            format!("另一个 CSwitch 同步正在进行，请等待其完成后重试：{error}").into()
         })?;
     Ok(file)
 }
@@ -483,6 +683,22 @@ fn clear_transaction_journal(codex_home: &Path) -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn ensure_file_unchanged(path: &Path, expected: Option<&[u8]>) -> Result<(), Box<dyn Error>> {
+    let current = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("写入前读取 {} 失败：{error}", path.display()).into()),
+    };
+    if current.as_deref() != expected {
+        return Err(format!(
+            "{} 在同步期间发生了新修改，保留当前文件并撤销本次同步",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn recover_pending_transaction_locked(codex_home: &Path) -> Result<(), Box<dyn Error>> {
     let journal_path = codex_home.join(TRANSACTION_FILE);
     let content = match fs::read(&journal_path) {
@@ -509,6 +725,8 @@ fn recover_pending_transaction_locked(codex_home: &Path) -> Result<(), Box<dyn E
         return Err(format!("不支持的同步备份版本：{}", manifest.version).into());
     }
 
+    // Recovery mutates live files too: never restore while a desktop writer is active.
+    crate::codex_process::close_if_running()?;
     let mut errors = Vec::new();
     restore_from_recovery_manifest(codex_home, &backup_dir, &manifest, &mut errors);
     if errors.is_empty() {
@@ -530,10 +748,67 @@ fn restore_from_recovery_manifest(
     manifest: &RecoveryManifest,
     errors: &mut Vec<String>,
 ) {
+    if manifest.checked_files {
+        for (name, planned, destination, present, managed) in [
+            (
+                "auth.json",
+                "auth.applied.json",
+                codex_home.join("auth.json"),
+                manifest.auth_present,
+                manifest.auth_replaced,
+            ),
+            (
+                "config.toml",
+                "config.applied.toml",
+                codex_home.join("config.toml"),
+                manifest.config_present,
+                true,
+            ),
+            (
+                "settings.json",
+                "settings.applied.json",
+                codex_home.join("cswitch-profiles/settings.json"),
+                manifest.settings_present,
+                manifest.settings_managed,
+            ),
+        ] {
+            if !managed {
+                continue;
+            }
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let baseline = if present {
+                    Some(fs::read(backup_dir.join(name))?)
+                } else {
+                    None
+                };
+                let intended = fs::read(backup_dir.join(planned))?;
+                let current = match fs::read(&destination) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if current != baseline && current.as_deref() != Some(intended.as_slice()) {
+                    return Err(
+                        format!("{name} 在同步中断后发生了新修改，保留当前文件与备份").into(),
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(error.to_string());
+            }
+        }
+        if !errors.is_empty() {
+            return;
+        }
+    }
     for (name, present) in [
         ("auth.json", manifest.auth_present),
         ("config.toml", manifest.config_present),
     ] {
+        if name == "auth.json" && manifest.checked_files && !manifest.auth_replaced {
+            continue;
+        }
         let destination = codex_home.join(name);
         let content = if present {
             match fs::read(backup_dir.join(name)) {
@@ -551,13 +826,42 @@ fn restore_from_recovery_manifest(
         }
     }
 
+    if manifest.settings_managed {
+        let settings = if manifest.settings_present {
+            match fs::read(backup_dir.join("settings.json")) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    errors.push(format!("读取设置备份失败：{error}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = restore_optional_file(
+            &codex_home.join("cswitch-profiles/settings.json"),
+            settings.as_deref(),
+        ) {
+            errors.push(format!("恢复设置失败：{error}"));
+        }
+    }
     if let Some(destination) = manifest.sqlite_path.as_deref() {
         let source = backup_dir.join("sqlite").join(STATE_DB_NAME);
-        if let Err(error) = restore_sqlite(&source, Path::new(destination)) {
+        let destination = Path::new(destination);
+        if !destination.canonicalize().is_ok_and(|path| {
+            codex_home
+                .canonicalize()
+                .is_ok_and(|home| path.starts_with(home))
+        }) {
+            errors.push("SQLite 恢复路径不属于当前 .codex".into());
+        } else if let Err(error) =
+            restore_sqlite(&source, destination, manifest.target_provider.as_deref())
+        {
             errors.push(format!("恢复 SQLite 失败：{error}"));
         }
     }
 
+    restore_extra_databases(codex_home, backup_dir, manifest, errors);
     for (index, entry) in manifest.rollout_files.iter().enumerate() {
         let path = PathBuf::from(&entry.path);
         if let Err(error) = validate_rollout_recovery_path(codex_home, &path).and_then(|()| {
@@ -637,10 +941,22 @@ fn collect_rollout_changes(
     paths.sort();
 
     let mut changes = Vec::new();
+    let mut invalid = Vec::new();
     for path in paths {
-        let (first_line, separator) = read_first_line(&path)?;
-        let mut record: Value = serde_json::from_str(&first_line)
-            .map_err(|error| format!("rollout 首行 JSON 无效 {}：{error}", path.display()))?;
+        let (first_line, separator) = match read_first_line(&path) {
+            Ok(line) => line,
+            Err(error) => {
+                invalid.push(format!("{}：{error}", path.display()));
+                continue;
+            }
+        };
+        let mut record: Value = match serde_json::from_str(&first_line) {
+            Ok(record) => record,
+            Err(error) => {
+                invalid.push(format!("{}：首行 JSON 无效：{error}", path.display()));
+                continue;
+            }
+        };
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             return Err(format!("rollout 首行不是 session_meta：{}", path.display()).into());
         }
@@ -669,6 +985,13 @@ fn collect_rollout_changes(
             original_provider,
         });
     }
+    if !invalid.is_empty() {
+        return Err(format!(
+            "以下会话文件需要先修复，原文件已保留：\n{}",
+            invalid.join("\n")
+        )
+        .into());
+    }
     Ok(changes)
 }
 
@@ -693,7 +1016,8 @@ fn collect_rollout_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Bo
 }
 
 fn read_first_line(path: &Path) -> Result<(String, String), Box<dyn Error>> {
-    let file = File::open(path)?;
+    let file =
+        File::open(path).map_err(|error| format!("读取会话失败 {}：{error}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut bytes = Vec::new();
     if reader.read_until(b'\n', &mut bytes)? == 0 {
@@ -742,6 +1066,12 @@ fn rewrite_first_line(
         output.write_all(replacement_first_line.as_bytes())?;
         output.write_all(separator.as_bytes())?;
         io::copy(&mut reader, &mut output)?;
+        let current = reader.get_ref().metadata()?;
+        if current.len() != metadata.len() || current.modified()? != metadata.modified()? {
+            return Err(
+                format!("会话正文在复制期间发生变化，已停止替换：{}", path.display()).into(),
+            );
+        }
         output.sync_all()?;
         fs::set_permissions(&temporary, metadata.permissions())?;
         drop(output);
@@ -757,106 +1087,44 @@ fn rewrite_first_line(
 }
 
 fn resolve_state_db(codex_home: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
-    let existing = [
-        codex_home.join("sqlite").join(STATE_DB_NAME),
-        codex_home.join(STATE_DB_NAME),
-    ]
-    .into_iter()
-    .enumerate()
-    .filter(|(_, path)| path.is_file())
-    .collect::<Vec<_>>();
-    if existing.len() <= 1 {
-        return Ok(existing.into_iter().next().map(|(_, path)| path));
-    }
-
-    let rollout_count = count_rollout_files(codex_home)? as i64;
-    let mut readable = existing
-        .iter()
-        .filter_map(|(priority, path)| {
-            read_state_db_candidate_stats(path, *priority, rollout_count).ok()
-        })
-        .collect::<Vec<_>>();
-    if readable.is_empty() {
-        return Ok(existing.into_iter().next().map(|(_, path)| path));
-    }
-
-    readable.sort_by(|left, right| {
-        left.rollout_distance
-            .cmp(&right.rollout_distance)
-            .then_with(|| right.thread_count.cmp(&left.thread_count))
-            .then_with(|| {
-                right
-                    .max_thread_timestamp_ms
-                    .cmp(&left.max_thread_timestamp_ms)
-            })
-            .then_with(|| right.modified_at.cmp(&left.modified_at))
-            .then_with(|| left.priority.cmp(&right.priority))
-    });
-    Ok(readable.into_iter().next().map(|candidate| candidate.path))
+    Ok(state_databases(codex_home)?.into_iter().next())
 }
 
-fn count_rollout_files(codex_home: &Path) -> Result<usize, Box<dyn Error>> {
+fn state_databases(codex_home: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut paths = Vec::new();
-    for directory in SESSION_DIRS {
-        collect_rollout_paths(&codex_home.join(directory), &mut paths)?;
+    let config_path = codex_home.join("config.toml");
+    if config_path.exists() {
+        let text = fs::read_to_string(&config_path)?;
+        let config = crate::config::parse_config(&text)?;
+        if let Some(directory) = config.get("sqlite_home").and_then(toml_edit::Item::as_str) {
+            let directory = Path::new(directory);
+            let path = if directory.is_absolute() {
+                directory.to_path_buf()
+            } else {
+                codex_home.join(directory)
+            }
+            .join(STATE_DB_NAME);
+            if path.exists() {
+                if !path.canonicalize()?.starts_with(codex_home.canonicalize()?) {
+                    return Err("sqlite_home 指向当前 .codex 目录之外".into());
+                }
+                paths.push(path);
+            }
+        }
     }
-    Ok(paths.len())
-}
-
-fn read_state_db_candidate_stats(
-    path: &Path,
-    priority: usize,
-    rollout_count: i64,
-) -> Result<StateDbCandidateStats, Box<dyn Error>> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let thread_count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
-    let rollout_distance = if rollout_count == 0 {
-        0
-    } else {
-        (thread_count - rollout_count).abs()
-    };
-    Ok(StateDbCandidateStats {
-        path: path.to_path_buf(),
-        priority,
-        thread_count,
-        max_thread_timestamp_ms: max_thread_timestamp_ms(&connection)?,
-        modified_at: fs::metadata(path)?.modified()?,
-        rollout_distance,
-    })
-}
-
-fn max_thread_timestamp_ms(connection: &Connection) -> Result<i64, Box<dyn Error>> {
-    for (column, multiplier) in [
-        ("updated_at_ms", 1),
-        ("updated_at", 1000),
-        ("created_at_ms", 1),
-        ("created_at", 1000),
+    for path in [
+        codex_home.join(STATE_DB_NAME),
+        codex_home.join("sqlite").join(STATE_DB_NAME),
     ] {
-        if table_has_column(connection, column)? {
-            let timestamp: i64 = connection.query_row(
-                &format!("SELECT COALESCE(MAX({column}), 0) FROM threads"),
-                [],
-                |row| row.get(0),
-            )?;
-            return Ok(timestamp.saturating_mul(multiplier));
+        if path.is_file()
+            && !paths
+                .iter()
+                .any(|existing| existing.canonicalize().ok() == path.canonicalize().ok())
+        {
+            paths.push(path);
         }
     }
-    Ok(0)
-}
-
-fn table_has_column(connection: &Connection, column: &str) -> Result<bool, Box<dyn Error>> {
-    let mut statement = connection.prepare("PRAGMA table_info(threads)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for candidate in columns {
-        if candidate? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(paths)
 }
 
 fn open_state_db(path: &Path) -> Result<Connection, Box<dyn Error>> {
@@ -1094,15 +1362,76 @@ fn backup_sqlite(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-fn restore_sqlite(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
-    let source_connection = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut destination_connection = Connection::open_with_flags(
-        destination,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    destination_connection.busy_timeout(Duration::from_secs(2))?;
-    let backup = Backup::new(&source_connection, &mut destination_connection)?;
-    backup.run_to_completion(16, Duration::from_millis(20), None)?;
+fn restore_extra_databases(
+    codex_home: &Path,
+    backup_dir: &Path,
+    manifest: &RecoveryManifest,
+    errors: &mut Vec<String>,
+) {
+    for (index, destination) in manifest.extra_sqlite_paths.iter().enumerate() {
+        let destination = Path::new(destination);
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            if !destination
+                .canonicalize()?
+                .starts_with(codex_home.canonicalize()?)
+            {
+                return Err("额外 SQLite 恢复路径不属于当前 .codex".into());
+            }
+            restore_sqlite(
+                &backup_dir
+                    .join("sqlite")
+                    .join(format!("extra-{index}.sqlite")),
+                destination,
+                manifest.target_provider.as_deref(),
+            )
+        })();
+        if let Err(error) = result {
+            errors.push(format!(
+                "恢复 SQLite 失败 {}：{error}",
+                destination.display()
+            ));
+        }
+    }
+}
+
+fn restore_sqlite(
+    source: &Path,
+    destination: &Path,
+    expected_provider: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let backup = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut destination = open_state_db(destination)?;
+    let transaction = destination.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut statement = backup.prepare("SELECT id, model_provider FROM threads")?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })? {
+        let (id, provider) = row?;
+        if let Some(expected) = expected_provider {
+            if provider.as_deref() == Some(expected) {
+                continue;
+            }
+            let current = transaction.query_row(
+                "SELECT model_provider FROM threads WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, Option<String>>(0),
+            );
+            match current {
+                Ok(current) if current == provider => continue,
+                Ok(current) if current.as_deref() == Some(expected) => {}
+                Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+                Ok(_) => {
+                    return Err(format!("任务 {id} 在事务中断后被再次修改，保留当前数据库").into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        transaction.execute(
+            "UPDATE threads SET model_provider = ?1 WHERE id = ?2",
+            params![provider, id],
+        )?;
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1135,8 +1464,29 @@ fn rollback(
     }
     if sqlite_mutated && let Some(destination) = state_db {
         let source = backup_dir.join("sqlite").join(STATE_DB_NAME);
-        if let Err(error) = restore_sqlite(&source, destination) {
+        let target = fs::read(backup_dir.join("manifest.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RecoveryManifest>(&bytes).ok())
+            .and_then(|manifest| manifest.target_provider);
+        if let Err(error) = restore_sqlite(&source, destination, target.as_deref()) {
             errors.push(format!("恢复 SQLite 失败：{error}"));
+        }
+    }
+    if sqlite_mutated {
+        let manifest = fs::read(backup_dir.join("manifest.json"))
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<RecoveryManifest>(&bytes)
+                    .map_err(|error| error.to_string())
+            });
+        match manifest {
+            Ok(manifest) => restore_extra_databases(
+                config_path.parent().expect("config parent"),
+                backup_dir,
+                &manifest,
+                &mut errors,
+            ),
+            Err(error) => errors.push(format!("读取额外 SQLite 恢复清单失败：{error}")),
         }
     }
     for index in applied_rollouts.iter().rev() {
@@ -1626,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_sqlite_directory_database_yields_to_matching_legacy_database() {
+    fn both_layouts_are_kept_consistent_when_task_counts_differ() {
         let directory = tempdir().expect("tempdir");
         let codex_home = directory.path();
         let sqlite_directory_db = codex_home.join("sqlite/state_5.sqlite");
@@ -1652,6 +2002,14 @@ mod tests {
             r#"{"type":"event_msg","payload":{"message":"three"}}"#,
         );
 
+        // Task counts/IDs can differ; both databases must still move together.
+        Connection::open(&legacy_db)
+            .unwrap()
+            .execute(
+                "UPDATE threads SET id = 'thread-id' WHERE id = 'thread-0'",
+                [],
+            )
+            .unwrap();
         assert_eq!(
             resolve_state_db(codex_home).expect("resolve state db"),
             Some(legacy_db.clone())
@@ -1673,7 +2031,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read active providers");
-        assert_eq!(stale_provider, "openai");
+        assert_eq!(stale_provider, "custom");
         assert_eq!(active_remaining, 0);
     }
 
@@ -1768,7 +2126,7 @@ mod tests {
             apply_provider_config(codex_home, None, b"model_provider = \"custom\"\n", "custom")
                 .expect_err("legacy sync should block CSwitch");
 
-        assert!(error.to_string().contains("QuotaPlusPlus"), "{error}");
+        assert!(error.to_string().contains("CSwitch"), "{error}");
         assert_eq!(
             fs::read(rollout).expect("read rollout after rejection"),
             original_rollout
@@ -1826,5 +2184,231 @@ mod tests {
         assert!(error.to_string().contains("同时存在旧事务"), "{error}");
         assert!(codex_home.join(TRANSACTION_FILE).is_file());
         assert!(codex_home.join(LEGACY_TRANSACTION_FILE).is_file());
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use tempfile::tempdir;
+    #[test]
+    fn database_recovery_preserves_new_tasks_and_user_fields() {
+        let home = tempdir().unwrap();
+        let source = home.path().join("backup.sqlite");
+        let target = home.path().join("state.sqlite");
+        for path in [&source, &target] {
+            Connection::open(path).unwrap().execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,model_provider TEXT,title TEXT); INSERT INTO threads VALUES('old','openai','before');").unwrap();
+        }
+        Connection::open(&target).unwrap().execute_batch("UPDATE threads SET model_provider='custom',title='edited';INSERT INTO threads VALUES('new','custom','new task');").unwrap();
+        restore_sqlite(&source, &target, Some("custom")).unwrap();
+        let db = Connection::open(target).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM threads", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row("SELECT title FROM threads WHERE id='old'", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "edited"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT model_provider FROM threads WHERE id='old'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "openai"
+        );
+    }
+    #[test]
+    fn both_database_layouts_are_synchronized_without_guessing() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join("sqlite")).unwrap();
+        for path in [
+            home.path().join("state_5.sqlite"),
+            home.path().join("sqlite/state_5.sqlite"),
+        ] {
+            Connection::open(path)
+                .unwrap()
+                .execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,model_provider TEXT);")
+                .unwrap();
+        }
+        for path in state_databases(home.path()).unwrap() {
+            Connection::open(path)
+                .unwrap()
+                .execute("INSERT INTO threads VALUES ('same','openai')", [])
+                .unwrap();
+        }
+        let report = apply_provider_state(
+            home.path(),
+            None,
+            b"model_provider='custom'\n",
+            "custom",
+            AuthUpdate::Keep,
+        )
+        .unwrap();
+        assert_eq!(report.sqlite_rows_updated, 2);
+        for path in state_databases(home.path()).unwrap() {
+            verify_sqlite_provider(&path, "custom").unwrap();
+        }
+    }
+    #[test]
+    fn settings_recover_with_prepared_transaction() {
+        let home = tempdir().unwrap();
+        let root = home.path();
+        fs::create_dir(root.join("cswitch-profiles")).unwrap();
+        let original = b"{\"keepOfficialAuth\":false}";
+        fs::write(root.join("cswitch-profiles/settings.json"), original).unwrap();
+        let backup = create_backup(root, None, None, None, &[], &[], "custom").unwrap();
+        fs::write(backup.join("settings.json"), original).unwrap();
+        let path = backup.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["settingsManaged"] = serde_json::json!(true);
+        manifest["settingsPresent"] = serde_json::json!(true);
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        begin_transaction(root, &backup).unwrap();
+        fs::write(
+            root.join("cswitch-profiles/settings.json"),
+            b"{\"keepOfficialAuth\":true}",
+        )
+        .unwrap();
+        recover_pending_state(root).unwrap();
+        assert_eq!(
+            fs::read(root.join("cswitch-profiles/settings.json")).unwrap(),
+            original
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_database_regression_tests {
+    use super::*;
+    #[test]
+    fn concurrent_file_edits_are_preserved_and_history_rolls_back() {
+        for unchanged in [false, true] {
+            for edited in ["config.toml", "auth.json", "cswitch-profiles/settings.json"] {
+                let home = tempfile::tempdir().unwrap();
+                let root = home.path();
+                fs::create_dir(root.join("cswitch-profiles")).unwrap();
+                fs::write(root.join("config.toml"), b"model='old'\n").unwrap();
+                fs::write(root.join("auth.json"), b"old-auth").unwrap();
+                fs::write(root.join("cswitch-profiles/settings.json"), b"old-settings").unwrap();
+                Connection::open(root.join(STATE_DB_NAME)).unwrap().execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT); INSERT INTO threads VALUES('thread','openai');").unwrap();
+                let result = apply_provider_config_with_settings_and_hook(
+                    root,
+                    Some(b"model='old'\n"),
+                    if unchanged {
+                        b"model='old'\n"
+                    } else {
+                        b"model='new'\n"
+                    },
+                    "custom",
+                    AuthUpdate::Replace(if unchanged { b"old-auth" } else { b"new-auth" }),
+                    Some(if unchanged {
+                        b"old-settings"
+                    } else {
+                        b"new-settings"
+                    }),
+                    || {
+                        fs::write(root.join(edited), b"# concurrent-user-edit")?;
+                        Ok(())
+                    },
+                );
+                assert!(result.is_err(), "overwrote {edited}");
+                assert_eq!(
+                    fs::read(root.join(edited)).unwrap(),
+                    b"# concurrent-user-edit"
+                );
+                let provider: String = Connection::open(root.join(STATE_DB_NAME))
+                    .unwrap()
+                    .query_row("SELECT model_provider FROM threads", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(provider, "openai");
+                assert!(!root.join(TRANSACTION_FILE).exists());
+            }
+        }
+    }
+    #[test]
+    fn recovery_preserves_settings_modified_after_interruption() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        fs::create_dir(root.join("cswitch-profiles")).unwrap();
+        let old_config = b"model='old'\n";
+        let new_config = b"model='new'\n";
+        let settings_path = root.join("cswitch-profiles/settings.json");
+        let external_settings = br#"{"keepOfficialAuth":true,"userEdit":"keep"}"#;
+        let backup = create_backup(root, Some(old_config), None, None, &[], &[], "custom").unwrap();
+        fs::write(backup.join("config.applied.toml"), new_config).unwrap();
+        fs::write(
+            backup.join("settings.json"),
+            br#"{"keepOfficialAuth":false}"#,
+        )
+        .unwrap();
+        fs::write(
+            backup.join("settings.applied.json"),
+            br#"{"keepOfficialAuth":true}"#,
+        )
+        .unwrap();
+        let path = backup.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["settingsManaged"] = true.into();
+        manifest["settingsPresent"] = true.into();
+        manifest["checkedFiles"] = true.into();
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        begin_transaction(root, &backup).unwrap();
+        fs::write(root.join("config.toml"), new_config).unwrap();
+        fs::write(&settings_path, external_settings).unwrap();
+        assert!(recover_pending_state(root).is_err());
+        assert_eq!(fs::read(settings_path).unwrap(), external_settings);
+        assert_eq!(fs::read(root.join("config.toml")).unwrap(), new_config);
+        assert!(root.join(TRANSACTION_FILE).exists());
+    }
+    #[test]
+    fn both_databases_roll_back_when_final_config_write_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        fs::create_dir(root.join("sqlite")).unwrap();
+        let paths = [
+            root.join("state_5.sqlite"),
+            root.join("sqlite/state_5.sqlite"),
+        ];
+        for (i, path) in paths.iter().enumerate() {
+            let db = Connection::open(path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY,model_provider TEXT,title TEXT);",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES('thread',?1,'keep')",
+                [format!("provider-{i}")],
+            )
+            .unwrap();
+        }
+        assert!(
+            apply_provider_config_with_hook(
+                root,
+                None,
+                b"model_provider='custom'\n",
+                "custom",
+                AuthUpdate::Keep,
+                || Err("injected final write failure".into())
+            )
+            .is_err()
+        );
+        for (i, path) in paths.iter().enumerate() {
+            let provider: String = Connection::open(path)
+                .unwrap()
+                .query_row("SELECT model_provider FROM threads", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(provider, format!("provider-{i}"));
+        }
+        assert!(!root.join("config.toml").exists());
     }
 }

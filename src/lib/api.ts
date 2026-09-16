@@ -17,6 +17,7 @@ export const cswitchApi = {
       apiUrl: draft.apiUrl,
       apiKey: draft.apiKey,
     }),
+  refreshProviderModels: (providerId: string) => invoke<ProviderState>("refresh_provider_models", { providerId }),
   activateProvider: (providerId: string) =>
     invoke<ProviderSyncReport>("activate_provider", { providerId }),
   enableProviderRouting: (providerId: string) =>

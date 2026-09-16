@@ -65,11 +65,10 @@ pub(crate) fn build_provider_config(
     api_url: &str,
     api_key: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let api_key = validate_api_key(api_key)?;
+    validate_api_key(api_key)?;
     let mut document = parse_config(original)?;
     document.remove("experimental_bearer_token");
     document["model_provider"] = value(CUSTOM_PROVIDER_ID);
-    document.remove("model_catalog_json");
     if !document.contains_key("model_providers") {
         let mut providers = Table::new();
         providers.set_implicit(true);
@@ -91,7 +90,23 @@ pub(crate) fn build_provider_config(
     provider["base_url"] = value(api_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
-    provider["experimental_bearer_token"] = value(api_key);
+    provider.remove("experimental_bearer_token");
+    Ok(document.to_string())
+}
+
+pub(crate) fn set_request_bearer(
+    config: &str,
+    token: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    let mut document = parse_config(config)?;
+    let provider = document["model_providers"]["custom"]
+        .as_table_mut()
+        .ok_or("缺少 custom 供应商配置")?;
+    if let Some(token) = token {
+        provider["experimental_bearer_token"] = value(validate_api_key(token)?);
+    } else {
+        provider.remove("experimental_bearer_token");
+    }
     Ok(document.to_string())
 }
 
@@ -105,7 +120,6 @@ pub(crate) fn build_custom_auth(api_key: &str) -> Result<Vec<u8>, Box<dyn Error>
 pub(crate) fn build_official_config(original: &str) -> Result<String, Box<dyn Error>> {
     let mut document = parse_config(original)?;
     document.remove("model_provider");
-    document.remove("model_catalog_json");
     document.remove("experimental_bearer_token");
     if let Some(providers) = document
         .get_mut("model_providers")
@@ -120,10 +134,26 @@ pub(crate) fn build_official_config(original: &str) -> Result<String, Box<dyn Er
 }
 
 pub(crate) fn parse_config(content: &str) -> Result<DocumentMut, Box<dyn Error>> {
+    let content = content.trim_start_matches('\u{feff}');
     if content.trim().is_empty() {
         Ok(DocumentMut::new())
     } else {
-        Ok(content.parse::<DocumentMut>()?)
+        let mut document = content.parse::<DocumentMut>()?;
+        if let Some(item) = document.get_mut("model_providers") {
+            normalize_table(item);
+            if let Some(providers) = item.as_table_mut()
+                && let Some(custom) = providers.get_mut(CUSTOM_PROVIDER_ID)
+            {
+                normalize_table(custom);
+            }
+        }
+        Ok(document)
+    }
+}
+
+fn normalize_table(item: &mut Item) {
+    if let Item::Value(toml_edit::Value::InlineTable(inline)) = item {
+        *item = Item::Table(inline.clone().into_table());
     }
 }
 
@@ -182,12 +212,36 @@ pub(crate) fn verify_provider_content(
         && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
         && provider
             .get("experimental_bearer_token")
-            .and_then(Item::as_str)
-            == Some(expected_key.as_str())
-        && !document.contains_key("model_catalog_json")
+            .is_none_or(|token| token.as_str() == Some(expected_key.as_str()))
         && auth_has_only_api_key;
     if !valid {
         return Err("配置写入后的验证未通过".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn official_switch_preserves_user_catalog_even_inside_profile_storage() {
+        let original = "model_provider = 'custom'\nmodel_catalog_json = '/home/user/.codex/cswitch-profiles/providers/saved/models-user.json'\n";
+        let updated = build_official_config(original).unwrap();
+        assert_eq!(
+            parse_config(&updated).unwrap()["model_catalog_json"].as_str(),
+            parse_config(original).unwrap()["model_catalog_json"].as_str()
+        );
+    }
+    #[test]
+    fn preserves_bom_and_inline_provider_settings() {
+        let source = "\u{feff}model_providers = { custom = { name = 'old', request_max_retries = 9 }, other = { name = 'other' } }\n";
+        let updated =
+            build_provider_config(source, "new", "http://localhost", "fixture-key").unwrap();
+        let document = parse_config(&updated).unwrap();
+        assert_eq!(
+            document["model_providers"]["custom"]["request_max_retries"].as_integer(),
+            Some(9)
+        );
+        assert!(document["model_providers"].get("other").is_some());
+    }
 }

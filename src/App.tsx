@@ -17,10 +17,12 @@ import type {
   ProviderDraft,
   ProviderState,
   ProviderSummary,
+  ProviderSyncReport,
   SavedProvider,
 } from "./types";
 
 const EMPTY_STATE: ProviderState = {
+  warnings: [],
   providers: [],
   activeProviderId: null,
   officialActive: false,
@@ -59,9 +61,18 @@ function App() {
     noticeTimer.current = window.setTimeout(() => setNotice(null), 3000);
   }, []);
 
+  const reportSuccess = (name: string, report: ProviderSyncReport) => {
+    const text = switchedNotice(name, Math.max(report.rolloutFilesUpdated, report.sqliteRowsUpdated));
+    showNotice(report.warnings?.length ? "error" : "success", [text, ...(report.warnings ?? [])].join("\n"));
+  };
+
   const refresh = useCallback(async () => {
     setState(await cswitchApi.listProviders());
   }, []);
+
+  useEffect(() => {
+    if (state.warnings.length) showNotice("error", state.warnings.join("\n"));
+  }, [state.warnings, showNotice]);
 
   useEffect(() => {
     let active = true;
@@ -83,6 +94,7 @@ function App() {
   }, [showNotice]);
 
   useEffect(() => {
+    let disposed = false;
     let unlistenProgress: (() => void) | undefined;
     let unlistenChanged: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
@@ -91,19 +103,20 @@ function App() {
       if (next.done) setBusy(null);
       else if (next.operation) setBusy(next.operation);
     }).then((fn) => {
-      unlistenProgress = fn;
+      if (disposed) fn(); else unlistenProgress = fn;
     });
     void cswitchApi.onProvidersChanged(() => {
-      void refresh();
+      void refresh().catch((error) => showNotice("error", errorText(error)));
     }).then((fn) => {
-      unlistenChanged = fn;
+      if (disposed) fn(); else unlistenChanged = fn;
     });
     void cswitchApi.onOperationError((message) => {
       showNotice("error", message);
     }).then((fn) => {
-      unlistenError = fn;
+      if (disposed) fn(); else unlistenError = fn;
     });
     return () => {
+      disposed = true;
       unlistenProgress?.();
       unlistenChanged?.();
       unlistenError?.();
@@ -138,7 +151,7 @@ function App() {
     try {
       const report = await cswitchApi.activateProvider(provider.id);
       await refresh();
-      showNotice("success", switchedNotice(provider.name, report.rolloutFilesUpdated));
+      reportSuccess(provider.name, report);
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
@@ -170,8 +183,10 @@ function App() {
         return;
       }
       if (wasActive) {
-        await cswitchApi.activateProvider(result.provider.id);
+        const report = await cswitchApi.activateProvider(result.provider.id);
         await refresh();
+        reportSuccess(result.provider.name, report);
+        return;
       }
       showNotice("success", wasActive ? "供应商已更新并重新应用" : "供应商已保存");
     } catch (error) {
@@ -200,11 +215,24 @@ function App() {
       const report = await cswitchApi.activateProvider(provider.id);
       setRoutingProvider(null);
       await refresh();
-      showNotice("success", switchedNotice(provider.name, report.rolloutFilesUpdated));
+      reportSuccess(provider.name, report);
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
       setProgress(null);
+      setBusy(null);
+    }
+  };
+
+  const refreshModels = async (provider: ProviderSummary) => {
+    if (busy || progress) return;
+    setBusy("models");
+    try {
+      setState(await cswitchApi.refreshProviderModels(provider.id));
+      showNotice("success", `${provider.name} 的模型列表已刷新`);
+    } catch (error) {
+      showNotice("error", errorText(error));
+    } finally {
       setBusy(null);
     }
   };
@@ -239,7 +267,7 @@ function App() {
     try {
       const report = await cswitchApi.startOfficialLogin();
       await refresh();
-      showNotice("success", switchedNotice("官方登录", report.rolloutFilesUpdated));
+      reportSuccess("官方登录", report);
     } catch (error) {
       const message = errorText(error);
       if (message !== "官方登录已取消") showNotice("error", message);
@@ -281,7 +309,7 @@ function App() {
   const cancelOfficial = async () => {
     try {
       await cswitchApi.cancelOfficialLogin();
-      showNotice("success", "已取消官方登录");
+      showNotice("success", "正在取消官方登录");
     } catch (error) {
       showNotice("error", errorText(error));
     }
@@ -317,7 +345,7 @@ function App() {
       <main>
         <section aria-label="官方登录">
           <article className={`provider-card official-card${state.officialActive ? " active" : ""}`}>
-            <button className="provider-select" type="button" disabled={locked || state.officialActive} onClick={useOfficial}>
+            <button className="provider-select" type="button" disabled={locked} onClick={useOfficial}>
               <span className="provider-icon official-icon" aria-hidden="true">
                 <CircleUserRound size={20} />
               </span>
@@ -344,7 +372,7 @@ function App() {
               <strong>切换第三方时保留官方登录</strong>
               <p>
                 {state.keepOfficialAuth
-                  ? "当前会保留 ChatGPT 登录态，并把请求转发到所选 API Key。关闭后改为 API Key 直连。"
+                  ? state.officialAuthAvailable ? "官方登录态已保留，请求使用当前供应商 API Key。" : "尚未保存官方登录，本次使用 API Key；完成官方登录后可保留。"
                   : "当前是 API Key 直连，会写入 auth.json。开启后保留 ChatGPT 登录，请求改走 API Key。"}
                 {!state.officialAuthAvailable && " 建议先完成一次官方登录再开启。"}
               </p>
@@ -384,6 +412,7 @@ function App() {
               activating={busy === provider.id}
               onActivate={() => void activate(provider)}
               onEdit={() => openEdit(provider)}
+              onRefreshModels={() => void refreshModels(provider)}
               onDelete={() => setDeletingProvider(provider)}
               onEnableRouting={() => setRoutingProvider(provider)}
             />

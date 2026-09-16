@@ -47,6 +47,8 @@ pub struct ProviderRecord {
     pub inference_endpoint: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub generation: Option<String>,
 }
 
 fn default_protocol() -> String {
@@ -188,7 +190,7 @@ impl ProfileStore {
             .into_iter()
             .find(|provider| provider.id == id)
             .ok_or_else(|| format!("供应商不存在：{id}"))?;
-        let directory = self.provider_dir(id);
+        let directory = self.record_dir(&record)?;
         let auth = fs::read(directory.join("auth.json"))
             .map_err(|error| format!("读取供应商 auth.json 失败：{error}"))?;
         let config = fs::read(directory.join("config.toml"))
@@ -248,6 +250,7 @@ impl ProfileStore {
         config: &[u8],
     ) -> Result<ProviderRecord, Box<dyn Error>> {
         validate_routing(protocol, routing_mode, inference_endpoint)?;
+        self.recover_deletions()?;
         let mut registry = self.load_registry()?;
         let existing_index = match id {
             Some(id) => {
@@ -276,69 +279,57 @@ impl ProfileStore {
         let id = existing_index
             .map(|index| registry.providers[index].id.clone())
             .unwrap_or_else(generate_provider_id);
-        let directory = self.provider_dir(&id);
-        create_private_dir(&directory)?;
-        let catalog_path = catalog.map(|_| directory.join(generate_catalog_file()));
-        let auth_path = directory.join("auth.json");
-        let config_path = directory.join("config.toml");
-        let previous_auth = read_optional(&auth_path)?;
-        let previous_config = read_optional(&config_path)?;
-
-        let result = (|| -> Result<ProviderRecord, Box<dyn Error>> {
-            if let (Some(path), Some(content)) = (catalog_path.as_deref(), catalog) {
-                atomic_write_private(path, content)?;
-                verify_file(path, content)?;
-            }
-            atomic_write_private(&auth_path, auth)?;
-            atomic_write_private(&config_path, config)?;
-            verify_file(&auth_path, auth)?;
-            verify_file(&config_path, config)?;
-
-            let now = Utc::now().to_rfc3339();
-            let record = ProviderRecord {
-                id: id.clone(),
-                name: name.to_string(),
-                api_url: api_url.to_string(),
-                catalog_file: catalog_path
-                    .as_ref()
-                    .and_then(|path| path.file_name())
-                    .and_then(|file| file.to_str())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        existing_index
-                            .and_then(|index| registry.providers[index].catalog_file.clone())
-                    }),
-                model_count: match catalog {
-                    Some(content) => count_catalog_models(content)?,
-                    None => existing_index
-                        .map(|index| registry.providers[index].model_count)
-                        .unwrap_or(0),
-                },
-                protocol: protocol.to_string(),
-                routing_mode: routing_mode.to_string(),
-                inference_endpoint: inference_endpoint.map(str::to_string),
-                created_at: existing_index
-                    .map(|index| registry.providers[index].created_at.clone())
-                    .unwrap_or_else(|| now.clone()),
-                updated_at: now,
-            };
-            if let Some(index) = existing_index {
-                registry.providers[index] = record.clone();
-            } else {
-                registry.providers.push(record.clone());
-            }
-            self.save_registry(&registry)?;
-            Ok(record)
-        })();
-
-        if result.is_err() {
-            let _ = restore_optional_file(&auth_path, previous_auth.as_deref());
-            let _ = restore_optional_file(&config_path, previous_config.as_deref());
-            if let Some(path) = catalog_path.as_deref() {
-                let _ = remove_optional_file(path);
-            }
+        let old = existing_index
+            .map(|_| self.load_provider(&id))
+            .transpose()?;
+        let root = self.provider_dir(&id);
+        let generations = root.join(GENERATIONS_DIR);
+        create_private_dir(&generations)?;
+        let generation = format!("generation-{}", generate_provider_id());
+        let staging = generations.join(format!(".{generation}.tmp"));
+        let directory = generations.join(&generation);
+        create_private_dir(&staging)?;
+        let effective_catalog =
+            catalog.or_else(|| old.as_ref().and_then(|profile| profile.catalog.as_deref()));
+        let catalog_file = effective_catalog.map(|_| "models-current.json".to_string());
+        write_new_private(&staging.join("config.toml"), config)?;
+        write_new_private(&staging.join("auth.json"), auth)?;
+        if let Some(bytes) = effective_catalog {
+            write_new_private(&staging.join("models-current.json"), bytes)?;
         }
-        result
+        verify_file(&staging.join("auth.json"), auth)?;
+        verify_file(&staging.join("config.toml"), config)?;
+        sync_directory(&staging)?;
+        fs::rename(&staging, &directory)?;
+        sync_directory(&generations)?;
+        let now = Utc::now().to_rfc3339();
+        let record = ProviderRecord {
+            id,
+            name: name.to_string(),
+            api_url: api_url.to_string(),
+            catalog_file,
+            model_count: effective_catalog
+                .map(count_catalog_models)
+                .transpose()?
+                .unwrap_or(0),
+            protocol: protocol.to_string(),
+            routing_mode: routing_mode.to_string(),
+            inference_endpoint: inference_endpoint.map(str::to_string),
+            created_at: old
+                .as_ref()
+                .map(|profile| profile.record.created_at.clone())
+                .unwrap_or_else(|| now.clone()),
+            updated_at: now,
+            generation: Some(generation),
+        };
+        if let Some(index) = existing_index {
+            registry.providers[index] = record.clone();
+        } else {
+            registry.providers.push(record.clone());
+        }
+        // The registry is the only commit point. A crash before this rename leaves the old pair visible.
+        self.save_registry(&registry)?;
+        Ok(record)
     }
 
     pub fn save_provider_without_catalog(
@@ -357,20 +348,19 @@ impl ProfileStore {
         config: &[u8],
         auth: &[u8],
     ) -> Result<(), Box<dyn Error>> {
-        validate_provider_id(id)?;
-        if !self
-            .load_registry()?
-            .providers
-            .iter()
-            .any(|provider| provider.id == id)
-        {
-            return Err(format!("供应商不存在：{id}").into());
-        }
-        let directory = self.provider_dir(id);
-        atomic_write_private(&directory.join("config.toml"), config)?;
-        atomic_write_private(&directory.join("auth.json"), auth)?;
-        verify_file(&directory.join("config.toml"), config)?;
-        verify_file(&directory.join("auth.json"), auth)
+        let previous = self.load_provider(id)?;
+        self.save_provider_with_routing(
+            Some(id),
+            &previous.record.name,
+            &previous.record.api_url,
+            auth,
+            previous.catalog.as_deref(),
+            &previous.record.protocol,
+            &previous.record.routing_mode,
+            previous.record.inference_endpoint.as_deref(),
+            config,
+        )?;
+        Ok(())
     }
 
     pub fn update_provider_routing(
@@ -399,21 +389,202 @@ impl ProfileStore {
 
     pub fn delete_provider(&self, id: &str) -> Result<(), Box<dyn Error>> {
         validate_provider_id(id)?;
+        self.recover_deletions()?;
         let mut registry = self.load_registry()?;
         let index = registry
             .providers
             .iter()
             .position(|provider| provider.id == id)
             .ok_or_else(|| format!("供应商不存在：{id}"))?;
-        registry.providers.remove(index);
-        self.save_registry(&registry)?;
         let directory = self.provider_dir(id);
-        if directory.is_dir() {
-            fs::remove_dir_all(&directory)
-                .map_err(|error| format!("删除供应商文件失败 {}：{error}", directory.display()))?;
-            sync_directory(directory.parent().ok_or("供应商目录没有父目录")?)?;
+        let directory_key = catalog_path_key(&directory)?;
+        if let Some(path) = self
+            .catalog_references(Some(id))?
+            .iter()
+            .find(|path| path.starts_with(&directory_key))
+        {
+            return Err(format!(
+                "配置或恢复备份仍引用供应商模型目录 {}，请先解除该引用再删除供应商",
+                path.display()
+            )
+            .into());
+        }
+        let tombstone = self
+            .root
+            .join(PROVIDERS_DIR)
+            .join(format!(".deleting-{id}"));
+        if directory.exists() {
+            fs::rename(&directory, &tombstone)?;
+        }
+        registry.providers.remove(index);
+        if let Err(error) = self.save_registry(&registry) {
+            if tombstone.exists() {
+                fs::rename(&tombstone, &directory).map_err(|restore| {
+                    format!("删除未提交：{error}；恢复供应商目录失败：{restore}")
+                })?;
+            }
+            return Err(error);
+        }
+        // Cleanup is retryable on the next list/load; the registry commit has already succeeded.
+        Ok(())
+    }
+
+    pub fn cleanup(&self) -> Result<(), Box<dyn Error>> {
+        self.recover_deletions()?;
+        let registry = self.load_registry()?;
+        let catalogs = self.catalog_references(None)?;
+        let root = self.root.join(PROVIDERS_DIR);
+        if !root.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name.strip_prefix(".deleting-") {
+                validate_provider_id(id)?;
+                if registry.providers.iter().any(|record| record.id == id) {
+                    fs::rename(entry.path(), self.provider_dir(id))?;
+                } else {
+                    let original = catalog_path_key(&self.provider_dir(id))?;
+                    if catalogs.iter().any(|path| path.starts_with(&original)) {
+                        return Err(format!(
+                            "模型目录仍引用已删除的供应商 {}，保留待清理目录 {}",
+                            id,
+                            entry.path().display()
+                        )
+                        .into());
+                    }
+                    fs::remove_dir_all(entry.path())?;
+                }
+            }
+        }
+        for record in &registry.providers {
+            if record.generation.is_some() {
+                let active = self.record_dir(record)?;
+                let root = self.provider_dir(&record.id);
+                prune_generations_preserving(&root.join(GENERATIONS_DIR), &active, &catalogs)?;
+                for entry in fs::read_dir(&root)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if (name == "auth.json"
+                            || name == "config.toml"
+                            || (name.starts_with("models-") && name.ends_with(".json")))
+                            && !catalogs.contains(&catalog_path_key(&entry.path())?)
+                        {
+                            fs::remove_file(entry.path())?;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    fn recover_deletions(&self) -> Result<(), Box<dyn Error>> {
+        for record in self.load_registry()?.providers {
+            let pending = self
+                .root
+                .join(PROVIDERS_DIR)
+                .join(format!(".deleting-{}", record.id));
+            if pending.exists() {
+                let target = self.provider_dir(&record.id);
+                fs::rename(&pending, &target).map_err(|error| {
+                    format!(
+                        "恢复未提交的供应商删除失败 {} -> {}：{error}",
+                        pending.display(),
+                        target.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    // A catalog path belongs to the user once it is referenced from a saved configuration.
+    // Include rollback configurations: deleting their target would make restoration incomplete.
+    fn catalog_references(
+        &self,
+        deleting_provider: Option<&str>,
+    ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+        let home = self.root.parent().ok_or("供应商目录缺少父目录")?;
+        let mut configs = vec![
+            home.join("config.toml"),
+            self.official_dir().join("config.toml"),
+        ];
+        for directory in [self.official_dir(), self.custom_dir()] {
+            if let Some(current) = read_optional(&directory.join(CURRENT_FILE))? {
+                let generation = std::str::from_utf8(&current)?.trim();
+                if generation != EMPTY_GENERATION {
+                    validate_generation(generation)?;
+                    configs.push(
+                        directory
+                            .join(GENERATIONS_DIR)
+                            .join(generation)
+                            .join("config.toml"),
+                    );
+                }
+            } else {
+                configs.push(directory.join("config.toml"));
+            }
+        }
+        for record in self.load_registry()?.providers {
+            if deleting_provider != Some(record.id.as_str()) {
+                configs.push(self.record_dir(&record)?.join("config.toml"));
+            }
+        }
+        for root in [home.join("cswitch-backups"), home.join("qpp-backups")] {
+            if !root.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    configs.push(entry.path().join("config.toml"));
+                    configs.push(entry.path().join("config.applied.toml"));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        for source in configs {
+            let Some(bytes) = read_optional(&source)? else {
+                continue;
+            };
+            let document = std::str::from_utf8(&bytes)
+                .map_err(|error| format!("读取模型目录引用失败 {}：{error}", source.display()))?;
+            let document = crate::config::parse_config(document)
+                .map_err(|error| format!("解析模型目录引用失败 {}：{error}", source.display()))?;
+            if let Some(path) = document
+                .get("model_catalog_json")
+                .and_then(toml_edit::Item::as_str)
+            {
+                let path = Path::new(path);
+                result.push(catalog_path_key(&if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    home.join(path)
+                })?);
+            }
+        }
+        Ok(result)
+    }
+
+    fn record_dir(&self, record: &ProviderRecord) -> Result<PathBuf, Box<dyn Error>> {
+        let mut root = self.provider_dir(&record.id);
+        let tombstone = self
+            .root
+            .join(PROVIDERS_DIR)
+            .join(format!(".deleting-{}", record.id));
+        if !root.exists() && tombstone.exists() {
+            root = tombstone;
+        }
+        match record.generation.as_deref() {
+            Some(generation) => {
+                validate_generation(generation)?;
+                Ok(root.join(GENERATIONS_DIR).join(generation))
+            }
+            None => Ok(root),
+        }
     }
 
     pub fn load_custom_config(&self) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
@@ -432,6 +603,7 @@ impl ProfileStore {
         read_optional(&directory.join("auth.json"))
     }
 
+    #[cfg(test)]
     pub fn save_custom_config(&self, config: &[u8]) -> Result<(), Box<dyn Error>> {
         let directory = self.custom_dir();
         create_private_dir(&directory)?;
@@ -440,6 +612,7 @@ impl ProfileStore {
         verify_file(&directory.join("config.toml"), config)
     }
 
+    #[cfg(test)]
     pub fn save_custom_auth(&self, auth: &[u8]) -> Result<(), Box<dyn Error>> {
         let directory = self.custom_dir();
         create_private_dir(&directory)?;
@@ -548,15 +721,6 @@ fn generate_provider_id() -> String {
     format!("provider-{created_at:x}-{sequence:x}")
 }
 
-fn generate_catalog_file() -> String {
-    let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("models-{created_at:x}-{sequence:x}.json")
-}
-
 fn count_catalog_models(content: &[u8]) -> Result<usize, Box<dyn Error>> {
     let document: serde_json::Value = serde_json::from_slice(content)?;
     document
@@ -564,13 +728,6 @@ fn count_catalog_models(content: &[u8]) -> Result<usize, Box<dyn Error>> {
         .and_then(serde_json::Value::as_array)
         .map(Vec::len)
         .ok_or_else(|| "models.json 缺少 models 数组".into())
-}
-
-fn restore_optional_file(path: &Path, content: Option<&[u8]>) -> Result<(), Box<dyn Error>> {
-    match content {
-        Some(content) => atomic_write_private(path, content),
-        None => remove_optional_file(path),
-    }
 }
 
 fn load_committed_pair(directory: &Path) -> Result<Option<OfficialProfile>, Box<dyn Error>> {
@@ -643,10 +800,19 @@ fn commit_pair(directory: &Path, config: &[u8], auth: &[u8]) -> Result<(), Box<d
 }
 
 fn prune_generations(generations: &Path, current: &Path) -> Result<(), Box<dyn Error>> {
+    prune_generations_preserving(generations, current, &[])
+}
+
+fn prune_generations_preserving(
+    generations: &Path,
+    current: &Path,
+    catalogs: &[PathBuf],
+) -> Result<(), Box<dyn Error>> {
     for entry in fs::read_dir(generations)? {
         let entry = entry?;
         let path = entry.path();
-        if path == current {
+        let key = catalog_path_key(&path)?;
+        if path == current || catalogs.iter().any(|catalog| catalog.starts_with(&key)) {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -657,6 +823,25 @@ fn prune_generations(generations: &Path, current: &Path) -> Result<(), Box<dyn E
         }
     }
     sync_directory(generations)
+}
+
+fn catalog_path_key(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    // Lexical normalization also handles references to files temporarily renamed during deletion.
+    let mut normalized = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        normalized = PathBuf::from(normalized.to_string_lossy().to_lowercase());
+    }
+    Ok(normalized)
 }
 
 fn validate_generation(generation: &str) -> Result<(), Box<dyn Error>> {
@@ -710,7 +895,7 @@ fn write_new_private(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-fn atomic_write_private(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
+pub(crate) fn atomic_write_private(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
     let parent = path.parent().ok_or("快照文件没有父目录")?;
     create_private_dir(parent)?;
     let temporary = parent.join(format!(
@@ -986,5 +1171,212 @@ mod tests {
             })
             .expect("save settings");
         assert!(store.keep_official_auth().expect("saved setting"));
+    }
+}
+
+#[cfg(test)]
+mod generation_regression_tests {
+    use super::*;
+    #[test]
+    fn cleanup_keeps_catalog_referenced_by_live_config_or_backup() {
+        for from_backup in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let store = ProfileStore::new(home.path());
+            let first = store
+                .save_provider(
+                    None,
+                    "fixture",
+                    "https://fixture.test",
+                    b"auth",
+                    Some(br#"{"models":[]}"#),
+                    b"model = 'fixture'\n",
+                )
+                .unwrap();
+            let catalog = store
+                .record_dir(&first)
+                .unwrap()
+                .join("models-current.json");
+            let source = if from_backup {
+                let backup = home.path().join("cswitch-backups/fixture");
+                fs::create_dir_all(&backup).unwrap();
+                backup.join("config.toml")
+            } else {
+                home.path().join("config.toml")
+            };
+            fs::write(
+                &source,
+                format!("model_catalog_json = '{}'\n", catalog.display()),
+            )
+            .unwrap();
+            store
+                .update_provider_snapshot(&first.id, b"model = 'new'\n", b"new-auth")
+                .unwrap();
+            store.cleanup().unwrap();
+            assert!(
+                catalog.is_file(),
+                "referenced catalog deleted: {}",
+                catalog.display()
+            );
+            fs::remove_file(source).unwrap();
+            store.cleanup().unwrap();
+            assert!(
+                !catalog.exists(),
+                "unreferenced catalog should be collected"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_preserves_provider_referenced_by_configuration() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(home.path());
+        let record = store
+            .save_provider(
+                None,
+                "fixture",
+                "https://fixture.test",
+                b"auth",
+                Some(br#"{"models":[]}"#),
+                b"model = 'fixture'\n",
+            )
+            .unwrap();
+        let catalog = store
+            .record_dir(&record)
+            .unwrap()
+            .join("models-current.json");
+        fs::write(
+            home.path().join("config.toml"),
+            format!("model_catalog_json = '{}'\n", catalog.display()),
+        )
+        .unwrap();
+        assert!(store.delete_provider(&record.id).is_err());
+        assert!(catalog.is_file());
+        assert_eq!(store.load_provider(&record.id).unwrap().auth, b"auth");
+    }
+    #[test]
+    fn partial_generation_is_not_visible_and_cleanup_removes_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(home.path());
+        let first = store
+            .save_provider(
+                None,
+                "fixture",
+                "https://fixture.test",
+                b"old-auth",
+                None,
+                b"# old-config",
+            )
+            .unwrap();
+        let dir = store
+            .provider_dir(&first.id)
+            .join(GENERATIONS_DIR)
+            .join("generation-uncommitted");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("auth.json"), b"partial-auth").unwrap();
+        assert_eq!(store.load_provider(&first.id).unwrap().auth, b"old-auth");
+        store.cleanup().unwrap();
+        assert!(!dir.exists());
+        let second = store
+            .save_provider(
+                Some(&first.id),
+                "fixture",
+                "https://fixture.test",
+                b"new-auth",
+                None,
+                b"# new-config",
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_provider(&first.id).unwrap().config,
+            b"# new-config"
+        );
+        store.cleanup().unwrap();
+        assert_eq!(
+            fs::read_dir(store.provider_dir(&second.id).join(GENERATIONS_DIR))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn interrupted_delete_is_recovered_before_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(home.path());
+        let record = store
+            .save_provider(
+                None,
+                "fixture",
+                "https://fixture.test",
+                b"auth",
+                None,
+                b"# config",
+            )
+            .unwrap();
+        let tomb = store
+            .root
+            .join(PROVIDERS_DIR)
+            .join(format!(".deleting-{}", record.id));
+        fs::rename(store.provider_dir(&record.id), &tomb).unwrap();
+        store.cleanup().unwrap();
+        assert_eq!(store.load_provider(&record.id).unwrap().auth, b"auth");
+        store.delete_provider(&record.id).unwrap();
+        store.cleanup().unwrap();
+        assert!(!tomb.exists());
+        assert!(store.list_providers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn interrupted_delete_is_recovered_before_an_update_without_listing() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(home.path());
+        let record = store
+            .save_provider(
+                None,
+                "fixture",
+                "https://fixture.test",
+                b"old-auth",
+                None,
+                b"# old-config",
+            )
+            .unwrap();
+        let tomb = store
+            .root
+            .join(PROVIDERS_DIR)
+            .join(format!(".deleting-{}", record.id));
+        fs::rename(store.provider_dir(&record.id), &tomb).unwrap();
+        store
+            .update_provider_snapshot(&record.id, b"# new-config", b"new-auth")
+            .unwrap();
+        store.cleanup().unwrap();
+        assert!(!tomb.exists());
+        assert_eq!(store.load_provider(&record.id).unwrap().auth, b"new-auth");
+    }
+
+    #[test]
+    fn deleting_provider_does_not_pin_its_own_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(home.path());
+        let record = store
+            .save_provider(
+                None,
+                "fixture",
+                "https://fixture.test",
+                b"auth",
+                Some(br#"{"models":[]}"#),
+                b"# config",
+            )
+            .unwrap();
+        let catalog = store
+            .record_dir(&record)
+            .unwrap()
+            .join("models-current.json");
+        let config = format!("model_catalog_json = '{}'\n", catalog.display());
+        store
+            .update_provider_snapshot(&record.id, config.as_bytes(), b"auth")
+            .unwrap();
+        store.delete_provider(&record.id).unwrap();
+        store.cleanup().unwrap();
+        assert!(store.list_providers().unwrap().is_empty());
+        assert!(!catalog.exists());
     }
 }

@@ -138,16 +138,20 @@ request_max_retries = 9
         document["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
         Some(true)
     );
-    assert!(!document.contains_key("model_catalog_json"));
+    assert_eq!(
+        document["model_catalog_json"].as_str(),
+        Some("/old/models.json")
+    );
     assert_eq!(
         document["model_providers"]["custom"]
             .get("request_max_retries")
             .and_then(Item::as_integer),
         Some(9)
     );
-    assert_eq!(
-        document["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("fixture-key")
+    assert!(
+        document["model_providers"]["custom"]
+            .get("experimental_bearer_token")
+            .is_none()
     );
 }
 
@@ -451,7 +455,12 @@ fn chat_only_provider_waits_for_confirmation_without_changing_live_files() {
             } else {
                 assert!(request.url().ends_with("/chat/completions"));
                 request
-                    .respond(Response::empty(StatusCode(400)))
+                    .respond(
+                        Response::from_string(
+                            r#"{"error":{"param":"model","message":"model is required"}}"#,
+                        )
+                        .with_status_code(StatusCode(400)),
+                    )
                     .expect("respond chat probe");
             }
         }
@@ -537,13 +546,13 @@ fn a_new_provider_requires_an_api_key_before_network_checks() {
 }
 
 #[test]
-fn official_config_removes_a_third_party_catalog_pointer() {
+fn official_config_preserves_a_user_catalog_pointer() {
     let original = "model_provider = \"custom\"\nmodel_catalog_json = \"/tmp/models.json\"\nmodel = \"test\"\n";
     let updated = build_official_config(original).expect("build official config");
     assert!(is_official_config(&updated).expect("classify official"));
     assert!(updated.contains("model = \"test\""));
     assert!(!updated.contains("model_provider"));
-    assert!(!updated.contains("model_catalog_json"));
+    assert!(updated.contains("model_catalog_json"));
 }
 
 #[test]
@@ -702,4 +711,104 @@ fn disabling_keep_official_auth_writes_the_api_key_into_auth() {
         state.active_provider_id.as_deref(),
         Some(provider.id.as_str())
     );
+}
+
+#[test]
+fn regression_close_reloads_user_configuration() {
+    let directory = tempdir().unwrap();
+    let home = directory.path();
+    fs::write(home.join("config.toml"), "model = 'before-close'\n").unwrap();
+    let record = save_fixture_provider(
+        home,
+        "Fixture",
+        "http://localhost",
+        "fixture-key",
+        &["fixture"],
+    );
+    activate_provider_inner_with_close(home, &record.id, || {
+        fs::write(home.join("config.toml"), "model = 'saved-on-close'\n").unwrap();
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(
+        parse_config(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap()["model"]
+            .as_str(),
+        Some("saved-on-close")
+    );
+}
+
+#[test]
+fn regression_failed_auth_mode_change_restores_setting() {
+    let directory = tempdir().unwrap();
+    let home = directory.path();
+    let record = save_fixture_provider(
+        home,
+        "Fixture",
+        "http://localhost",
+        "fixture-key",
+        &["fixture"],
+    );
+    activate_provider_inner_with_close(home, &record.id, || Ok(false)).unwrap();
+    fs::create_dir(home.join("sessions")).unwrap();
+    fs::write(home.join("sessions/rollout-broken.jsonl"), b"").unwrap();
+    assert!(set_keep_official_auth_inner(home, true).is_err());
+    assert!(!ProfileStore::new(home).keep_official_auth().unwrap());
+}
+
+#[test]
+fn regression_direct_auth_keeps_key_out_of_config() {
+    let directory = tempdir().unwrap();
+    let home = directory.path();
+    let record = save_fixture_provider(
+        home,
+        "Fixture",
+        "http://localhost",
+        "fixture-key",
+        &["fixture"],
+    );
+    activate_provider_inner_with_close(home, &record.id, || Ok(false)).unwrap();
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(!config.contains("experimental_bearer_token"));
+    assert_eq!(
+        api_key_from_auth(&fs::read(home.join("auth.json")).unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("fixture-key")
+    );
+}
+
+#[test]
+fn regression_preserves_user_catalog_pointer() {
+    let config = build_provider_config(
+        "model_catalog_json = '/user/models.json'\n",
+        "Fixture",
+        "http://localhost",
+        "fixture-key",
+    )
+    .unwrap();
+    assert_eq!(
+        parse_config(&config).unwrap()["model_catalog_json"].as_str(),
+        Some("/user/models.json")
+    );
+}
+
+#[test]
+fn cleanup_failure_keeps_provider_list_and_reports_warning() {
+    let directory = tempdir().unwrap();
+    let home = directory.path();
+    let record = save_fixture_provider(
+        home,
+        "Fixture",
+        "http://localhost",
+        "fixture-key",
+        &["fixture"],
+    );
+    fs::create_dir(home.join("cswitch-backups")).unwrap();
+    fs::create_dir(home.join("cswitch-backups/broken")).unwrap();
+    fs::write(home.join("cswitch-backups/broken/config.toml"), b"[invalid").unwrap();
+    let state = list_provider_state(home).unwrap();
+    assert_eq!(state.providers.len(), 1);
+    assert_eq!(state.providers[0].id, record.id);
+    assert_eq!(state.warnings.len(), 1);
+    assert!(state.warnings[0].contains("config.toml"));
 }

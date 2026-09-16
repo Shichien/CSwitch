@@ -4,6 +4,7 @@ import {
   LoaderCircle,
   Pencil,
   Route,
+  RefreshCw,
   Trash2,
 } from "lucide-react";
 import type { ProviderSummary } from "../types";
@@ -20,6 +21,7 @@ interface ProviderCardProps {
   activating: boolean;
   onActivate: () => void;
   onEdit: () => void;
+  onRefreshModels: () => void;
   onDelete: () => void;
   onEnableRouting: () => void;
 }
@@ -30,6 +32,7 @@ export function ProviderCard({
   activating,
   onActivate,
   onEdit,
+  onRefreshModels,
   onDelete,
   onEnableRouting,
 }: ProviderCardProps) {
@@ -42,8 +45,8 @@ export function ProviderCard({
       <button
         className="provider-select"
         type="button"
-        disabled={disabled || provider.active}
-        aria-label={provider.active ? `${provider.name} 正在使用` : `切换到 ${provider.name}`}
+        disabled={disabled}
+        aria-label={provider.active ? `重新应用 ${provider.name}` : `切换到 ${provider.name}`}
         onClick={onActivate}
       >
         <span className="provider-icon api-icon" aria-hidden="true">
@@ -70,6 +73,9 @@ export function ProviderCard({
       </button>
 
       <div className="provider-actions">
+        <button className="icon-button" type="button" aria-label={`刷新 ${provider.name} 的模型列表`} title="刷新模型列表" disabled={disabled} onClick={onRefreshModels}>
+          <RefreshCw size={16} />
+        </button>
         {needsRouting && (
           <button
             className="icon-button route-button"

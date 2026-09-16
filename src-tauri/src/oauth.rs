@@ -8,9 +8,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::env;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tiny_http::{Request, Response, Server, StatusCode as TinyStatusCode};
 use url::Url;
@@ -19,14 +19,26 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const ORIGINATOR: &str = "codex_cli_rs";
 // Track openai/codex latest stable: https://github.com/openai/codex/releases/latest
-const CODEX_CLI_VERSION: &str = "0.154.0";
-const LOCAL_NO_PROXY: &str = "localhost,127.0.0.1,::1";
+const CODEX_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
-static LOGIN_CANCELLED: AtomicBool = AtomicBool::new(false);
+static LOGIN: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+pub(crate) struct LoginAttempt(Arc<AtomicBool>);
+impl Drop for LoginAttempt {
+    fn drop(&mut self) {
+        if let Ok(mut current) = LOGIN.lock()
+            && current
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &self.0))
+        {
+            *current = None;
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum AuthHealth {
@@ -60,6 +72,41 @@ enum Callback {
     MissingCode,
 }
 
+pub fn validate_auth(auth: &[u8]) -> Result<AuthHealth, Box<dyn Error>> {
+    validate_auth_with(
+        &http_client()?,
+        "https://chatgpt.com/backend-api/wham/usage",
+        auth,
+    )
+}
+
+fn validate_auth_with(
+    client: &Client,
+    endpoint: &str,
+    auth: &[u8],
+) -> Result<AuthHealth, Box<dyn Error>> {
+    let document: Value = serde_json::from_slice(auth)?;
+    let token = token_field(&document, "access_token").ok_or("官方凭据缺少访问令牌")?;
+    let mut request = client.get(endpoint).bearer_auth(token);
+    if let Some(account) = existing_account_id(&document) {
+        request = request.header("ChatGPT-Account-Id", account);
+    }
+    let response = request.send()?;
+    match response.status() {
+        StatusCode::UNAUTHORIZED => Ok(AuthHealth::Invalid),
+        status if status.is_success() => {
+            let result: Value = response
+                .json()
+                .map_err(|_| "官方认证检查返回了非 JSON 响应")?;
+            if !result.is_object() {
+                return Err("官方认证检查响应格式异常".into());
+            }
+            Ok(AuthHealth::Valid(auth.to_vec()))
+        }
+        status => Err(format!("官方认证检查返回 {status}，本地凭据已保留").into()),
+    }
+}
+
 pub fn refresh_auth(auth: &[u8]) -> Result<AuthHealth, Box<dyn Error>> {
     let client = http_client()?;
     refresh_auth_with(&client, &format!("{ISSUER}/oauth/token"), auth)
@@ -90,16 +137,30 @@ pub fn inspect_auth(auth: &[u8]) -> LocalAuthState {
     }
 }
 
-pub fn begin_login() {
-    LOGIN_CANCELLED.store(false, Ordering::SeqCst);
+pub fn begin_login() -> Result<LoginAttempt, Box<dyn Error>> {
+    let mut current = LOGIN.lock().map_err(|_| "登录任务锁状态异常")?;
+    if current.is_some() {
+        return Err("另一个官方登录任务仍在结束，请稍后重试".into());
+    }
+    let token = Arc::new(AtomicBool::new(false));
+    *current = Some(token.clone());
+    Ok(LoginAttempt(token))
 }
 
 pub fn cancel_login() {
-    LOGIN_CANCELLED.store(true, Ordering::SeqCst);
+    if let Ok(current) = LOGIN.lock()
+        && let Some(token) = current.as_ref()
+    {
+        token.store(true, Ordering::SeqCst);
+    }
 }
 
 pub fn ensure_login_active() -> Result<(), Box<dyn Error>> {
-    ensure_not_cancelled(&LOGIN_CANCELLED)
+    let current = LOGIN.lock().map_err(|_| "登录任务锁状态异常")?;
+    if let Some(token) = current.as_ref() {
+        ensure_not_cancelled(token)?;
+    }
+    Ok(())
 }
 
 pub fn browser_login() -> Result<Vec<u8>, Box<dyn Error>> {
@@ -113,8 +174,12 @@ pub fn browser_login() -> Result<Vec<u8>, Box<dyn Error>> {
     ensure_login_active()?;
     webbrowser::open(auth_url.as_str()).map_err(|error| format!("打开登录页面失败：{error}"))?;
 
-    let (request, code) =
-        wait_for_authorization_code(&server, &state, LOGIN_TIMEOUT, &LOGIN_CANCELLED)?;
+    let cancelled = LOGIN
+        .lock()
+        .map_err(|_| "登录任务锁状态异常")?
+        .clone()
+        .ok_or("官方登录任务未初始化")?;
+    let (request, code) = wait_for_authorization_code(&server, &state, LOGIN_TIMEOUT, &cancelled)?;
     if let Err(error) = ensure_login_active() {
         respond(request, 409, "Sign-in cancelled. Return to CSwitch.")?;
         return Err(error);
@@ -134,7 +199,8 @@ pub fn browser_login() -> Result<Vec<u8>, Box<dyn Error>> {
                 respond(request, 409, "Sign-in cancelled. Return to CSwitch.")?;
                 return Err(error);
             }
-            respond(request, 200, "Sign-in complete. You can close this page.")?;
+            // Token exchange succeeded; losing the browser response must not discard rotated credentials.
+            let _ = respond(request, 200, "Sign-in complete. You can close this page.");
             Ok(auth)
         }
         Err(error) => {
@@ -198,21 +264,14 @@ fn http_client() -> Result<Client, Box<dyn Error>> {
     let mut headers = HeaderMap::new();
     headers.insert("originator", HeaderValue::from_static(ORIGINATOR));
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    let mut builder = Client::builder()
-        .timeout(REQUEST_TIMEOUT)
+    Ok(crate::network::blocking_builder(REQUEST_TIMEOUT)?
         .user_agent(oauth_user_agent())
-        .default_headers(headers);
-    if let Some(proxy_url) = detect_outbound_proxy() {
-        let proxy = reqwest::Proxy::all(&proxy_url)
-            .map_err(|error| format!("系统代理无效（{proxy_url}）：{error}"))?
-            .no_proxy(reqwest::NoProxy::from_string(&no_proxy_list()));
-        builder = builder.proxy(proxy);
-    }
-    Ok(builder.build()?)
+        .default_headers(headers)
+        .build()?)
 }
 
 fn oauth_user_agent() -> String {
-    format!("{ORIGINATOR}/{CODEX_CLI_VERSION}")
+    format!("CSwitch/{CODEX_CLI_VERSION}")
 }
 
 fn refresh_auth_with(
@@ -314,42 +373,7 @@ fn post_token_form(
         .send()?)
 }
 
-fn detect_outbound_proxy() -> Option<String> {
-    const KEYS: [&str; 6] = [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-    ];
-    for key in KEYS {
-        if let Ok(value) = env::var(key)
-            && let Some(url) = normalize_proxy_url(&value)
-        {
-            return Some(url);
-        }
-    }
-    #[cfg(windows)]
-    {
-        windows_system_proxy()
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
-}
-
-fn no_proxy_list() -> String {
-    match env::var("NO_PROXY")
-        .ok()
-        .or_else(|| env::var("no_proxy").ok())
-    {
-        Some(extra) if !extra.trim().is_empty() => format!("{extra},{LOCAL_NO_PROXY}"),
-        _ => LOCAL_NO_PROXY.to_string(),
-    }
-}
-
+#[cfg(test)]
 fn normalize_proxy_url(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -364,7 +388,7 @@ fn normalize_proxy_url(value: &str) -> Option<String> {
     matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h").then_some(url)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn parse_windows_proxy_server(server: &str) -> Option<String> {
     let server = server.trim();
     if server.is_empty() {
@@ -397,19 +421,6 @@ fn parse_windows_proxy_server(server: &str) -> Option<String> {
         }
     }
     http.or(socks)
-}
-
-#[cfg(windows)]
-fn windows_system_proxy() -> Option<String> {
-    let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
-        .ok()?;
-    let enabled: u32 = key.get_value("ProxyEnable").ok()?;
-    if enabled == 0 {
-        return None;
-    }
-    let server: String = key.get_value("ProxyServer").ok()?;
-    parse_windows_proxy_server(&server)
 }
 
 fn token_service_error(action: &str, status: StatusCode, body: &[u8]) -> String {
@@ -484,9 +495,9 @@ fn update_auth_document(
     let id_token = required_response_token(id_token, "id_token")?;
     let access_token = required_response_token(access_token, "access_token")?;
     let refresh_token = required_response_token(refresh_token, "refresh_token")?;
-    let account_id = existing_account_id(document)
-        .or_else(|| account_id_from_jwt(&id_token))
-        .or_else(|| account_id_from_jwt(&access_token));
+    let account_id = account_id_from_jwt(&id_token)
+        .or_else(|| account_id_from_jwt(&access_token))
+        .or_else(|| existing_account_id(document));
 
     let object = document.as_object_mut().ok_or("auth.json 顶层必须是对象")?;
     object.insert(
@@ -596,7 +607,10 @@ fn is_permanent_refresh_failure(body: &[u8]) -> bool {
     code.is_some_and(|code| {
         matches!(
             code.to_ascii_lowercase().as_str(),
-            "refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated"
+            "invalid_grant"
+                | "refresh_token_expired"
+                | "refresh_token_reused"
+                | "refresh_token_invalidated"
         )
     })
 }
@@ -1094,8 +1108,11 @@ mod tests {
     }
 
     #[test]
-    fn oauth_user_agent_matches_latest_stable_codex_cli() {
-        assert_eq!(oauth_user_agent(), "codex_cli_rs/0.154.0");
+    fn oauth_user_agent_identifies_our_actual_app_version() {
+        assert_eq!(
+            oauth_user_agent(),
+            concat!("CSwitch/", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -1113,5 +1130,49 @@ mod tests {
             Some("socks5://127.0.0.1:1080".to_string())
         );
         assert_eq!(parse_windows_proxy_server(""), None);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn duplicate_login_does_not_reset_cancellation() {
+        let attempt = begin_login().unwrap();
+        cancel_login();
+        assert!(begin_login().is_err());
+        assert!(ensure_login_active().is_err());
+        drop(attempt);
+        let next = begin_login().unwrap();
+        assert!(ensure_login_active().is_ok());
+        drop(next);
+    }
+    #[test]
+    fn revoked_unexpired_token_is_not_reported_healthy() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/usage", server.server_addr());
+        let task = std::thread::spawn(move || {
+            server
+                .recv()
+                .unwrap()
+                .respond(Response::empty(TinyStatusCode(401)))
+                .unwrap()
+        });
+        let client = Client::builder().no_proxy().build().unwrap();
+        let auth = serde_json::to_vec(
+            &json!({"tokens":{"access_token":"fixture-access","refresh_token":"fixture-refresh"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_auth_with(&client, &endpoint, &auth).unwrap(),
+            AuthHealth::Invalid
+        );
+        task.join().unwrap();
+    }
+    #[test]
+    fn invalid_grant_requires_new_login() {
+        assert!(is_permanent_refresh_failure(
+            br#"{"error":"invalid_grant"}"#
+        ));
     }
 }

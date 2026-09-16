@@ -33,8 +33,7 @@ fn acquire_file(path: &Path) -> Result<File, Box<dyn Error>> {
     })?;
     file.try_lock_exclusive()
         .map_err(|error| -> Box<dyn Error> {
-            format!("另一个 CSwitch 或 QuotaPlusPlus 实例正在操作，请等待其完成后重试：{error}")
-                .into()
+            format!("另一个 CSwitch 实例正在操作，请等待其完成后重试：{error}").into()
         })?;
     Ok(file)
 }
@@ -62,7 +61,7 @@ mod tests {
 
         let error = acquire(directory.path()).expect_err("legacy lock should block CSwitch");
 
-        assert!(error.to_string().contains("QuotaPlusPlus"), "{error}");
+        assert!(error.to_string().contains("CSwitch"), "{error}");
         drop(legacy);
         acquire(directory.path()).expect("lock after legacy release");
     }

@@ -1,5 +1,4 @@
 use reqwest::blocking::Client;
-use reqwest::redirect::Policy;
 use serde::Serialize;
 use std::error::Error;
 use std::time::Duration;
@@ -17,46 +16,38 @@ pub struct Detection {
 }
 
 pub fn detect(api_url: &str, api_key: &str) -> Result<Detection, Box<dyn Error>> {
-    let client = Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .redirect(Policy::none())
+    let client = crate::network::blocking_builder(PROBE_TIMEOUT)?
         .user_agent(concat!("CSwitch/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
-    let responses = probe_protocol(&client, api_url, api_key, "responses", false)?;
-    if let Some(endpoint) = responses {
-        return Ok(Detection {
-            protocol: "openai_responses".to_string(),
-            inference_endpoint: endpoint,
-            anthropic_auth: false,
-            routing_required: false,
-            message: "上游提供 Responses，使用直连模式".to_string(),
-        });
+    let mut errors = Vec::new();
+    for (probe, protocol, anthropic) in [
+        ("responses", "openai_responses", false),
+        ("chat", "openai_chat", false),
+        ("anthropic", "anthropic_messages", true),
+    ] {
+        match probe_protocol(&client, api_url, api_key, probe, anthropic) {
+            Ok(Some(endpoint)) => {
+                return Ok(Detection {
+                    protocol: protocol.into(),
+                    inference_endpoint: endpoint,
+                    anthropic_auth: anthropic,
+                    routing_required: protocol != "openai_responses",
+                    message: if protocol == "openai_responses" {
+                        "上游提供 Responses，使用直连模式".into()
+                    } else {
+                        format!(
+                            "上游提供 {}，需要启用本地协议转换",
+                            protocol_label(protocol)
+                        )
+                    },
+                });
+            }
+            Ok(None) => {}
+            Err(error) => errors.push(error.to_string()),
+        }
     }
-
-    if let Some(endpoint) = probe_protocol(&client, api_url, api_key, "chat", false)? {
-        return Ok(Detection {
-            protocol: "openai_chat".to_string(),
-            inference_endpoint: endpoint,
-            anthropic_auth: false,
-            routing_required: true,
-            message: "上游不提供 Responses，仅支持 OpenAI Chat Completions。是否启动本地路由进行协议转换？".to_string(),
-        });
-    }
-
-    if let Some(endpoint) = probe_protocol(&client, api_url, api_key, "anthropic", true)? {
-        return Ok(Detection {
-            protocol: "anthropic_messages".to_string(),
-            inference_endpoint: endpoint,
-            anthropic_auth: true,
-            routing_required: true,
-            message:
-                "上游不提供 Responses，仅支持 Anthropic Messages。是否启动本地路由进行协议转换？"
-                    .to_string(),
-        });
-    }
-
-    Err("没有检测到可用的 Responses、Chat Completions 或 Anthropic Messages 接口".into())
+    Err(format!("尚未确认可用的推理接口。{}", errors.join("；")).into())
 }
 
 pub fn protocol_label(protocol: &str) -> &'static str {
@@ -89,6 +80,7 @@ fn probe_protocol(
     protocol: &str,
     anthropic_auth: bool,
 ) -> Result<Option<String>, Box<dyn Error>> {
+    let mut errors = Vec::new();
     for endpoint in endpoint_candidates(api_url, protocol) {
         let request = client.post(&endpoint).json(&serde_json::json!({}));
         let response = if anthropic_auth {
@@ -99,25 +91,52 @@ fn probe_protocol(
         } else {
             request.bearer_auth(api_key).send()
         };
-        let response = response.map_err(|error| format!("探测上游接口失败 {endpoint}：{error}"))?;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                errors.push(format!("{endpoint}：{}", error.without_url()));
+                continue;
+            }
+        };
         let status = response.status();
-        if matches!(
-            status,
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            return Err(format!("API Key 未通过上游验证 {endpoint}，返回 {status}").into());
+        if matches!(status.as_u16(), 404 | 405 | 410) {
+            continue;
         }
-        if status.is_redirection() {
-            return Err(format!("上游接口发生重定向 {endpoint}，返回 {status}").into());
+        if matches!(status.as_u16(), 401 | 403) {
+            errors.push(format!("{endpoint}：认证返回 {status}"));
+            continue;
         }
-        if status != reqwest::StatusCode::NOT_FOUND
-            && status != reqwest::StatusCode::METHOD_NOT_ALLOWED
-            && status != reqwest::StatusCode::GONE
-        {
+        if status.is_server_error() || status.as_u16() == 429 || status.is_redirection() {
+            errors.push(format!("{endpoint}：探测返回 {status}"));
+            continue;
+        }
+        let body = response.json::<serde_json::Value>();
+        let confirmed = body.as_ref().is_ok_and(|body| {
+            let error = &body["error"];
+            let message = error["message"]
+                .as_str()
+                .or_else(|| body["message"].as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            (matches!(status.as_u16(), 400 | 422)
+                && (error["param"] == "model"
+                    || (message.contains("model")
+                        && (message.contains("required") || message.contains("missing")))))
+                || (status.is_success()
+                    && (body["object"] == "response"
+                        || body["object"] == "chat.completion"
+                        || body["type"] == "message"))
+        });
+        if confirmed {
             return Ok(Some(endpoint));
         }
+        errors.push(format!("{endpoint}：{status} 响应没有提供可识别的协议结构"));
     }
-    Ok(None)
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(errors.join("；").into())
+    }
 }
 
 fn endpoint_candidates(api_url: &str, protocol: &str) -> Vec<String> {
@@ -167,7 +186,7 @@ mod tests {
             let request = server.recv().expect("request");
             assert!(request.url().ends_with("/responses"));
             request
-                .respond(Response::empty(StatusCode(400)))
+                .respond(Response::from_string(r#"{"error":{"message":"Missing required parameter: model","param":"model"}}"#).with_status_code(StatusCode(400)))
                 .expect("respond responses probe");
         });
 
@@ -189,7 +208,7 @@ mod tests {
                 } else {
                     StatusCode(400)
                 };
-                request.respond(Response::empty(status)).expect("response");
+                request.respond(Response::from_string(r#"{"error":{"message":"Missing required parameter: model","param":"model"}}"#).with_status_code(status)).expect("response");
             }
         });
         let result = detect(&format!("http://{address}"), "key").expect("detect");
@@ -220,7 +239,7 @@ mod tests {
                             .any(|header| header.field.equiv("anthropic-version"))
                     );
                     request
-                        .respond(Response::empty(StatusCode(400)))
+                        .respond(Response::from_string(r#"{"error":{"message":"Missing required parameter: model","param":"model"}}"#).with_status_code(StatusCode(400)))
                         .expect("respond messages probe");
                 } else {
                     request
@@ -249,5 +268,27 @@ mod tests {
                 .unwrap(),
             "https://api.example.com"
         );
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use tiny_http::{Response, Server, StatusCode};
+    #[test]
+    fn server_error_is_not_protocol_support() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr());
+        let thread = std::thread::spawn(move || {
+            for _ in 0..6 {
+                server
+                    .recv()
+                    .unwrap()
+                    .respond(Response::empty(StatusCode(500)))
+                    .unwrap();
+            }
+        });
+        assert!(detect(&endpoint, "fixture").is_err());
+        thread.join().unwrap();
     }
 }

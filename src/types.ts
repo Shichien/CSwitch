@@ -15,6 +15,7 @@ export interface ProviderSummary {
 }
 
 export interface ProviderState {
+  warnings: string[];
   providers: ProviderSummary[];
   activeProviderId: string | null;
   officialActive: boolean;
@@ -42,6 +43,7 @@ export interface ProviderSyncReport {
   rolloutFilesUpdated: number;
   sqliteRowsUpdated: number;
   backupPath: string;
+  warnings: string[];
 }
 
 export interface ProviderDraft {

@@ -1,7 +1,8 @@
 use directories::UserDirs;
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use tauri::{AppHandle, Emitter};
 
@@ -16,10 +17,18 @@ use provider_sync::ProviderSyncReport;
 
 static APP_OPERATION: Mutex<()> = Mutex::new(());
 
+pub(crate) fn operation_in_progress() -> bool {
+    APP_OPERATION.try_lock().is_err()
+}
+
 pub(crate) fn run() -> Result<(), Box<dyn Error>> {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            tray::show_main_window(app)
+        }))
         .invoke_handler(tauri::generate_handler![
             list_providers,
+            refresh_provider_models,
             save_provider,
             enable_provider_routing,
             activate_provider,
@@ -38,6 +47,7 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
                     return;
                 }
                 api.prevent_close();
+                oauth::cancel_login();
                 let _ = window.hide();
             }
         })
@@ -95,17 +105,16 @@ async fn save_provider(
     api_key: String,
 ) -> Result<SavedProvider, String> {
     let progress = reporter(&app, "save", "保存供应商");
-    progress.stage(
-        1,
-        2,
-        "验证供应商",
-        "正在探测上游协议并拉取模型目录，可能需要几秒。",
-    );
     let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
     let task_home = codex_home.clone();
+    let task_progress = progress.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let task_started = started.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = acquire_app_operation()
             .map_err(|error| operation_error(&task_home, "获取应用操作锁", error))?;
+        task_started.store(true, Ordering::SeqCst);
+        task_progress.stage(1, 2, "验证供应商", "正在探测协议并读取模型列表。");
         let _process_guard = operation_lock::acquire(&task_home)
             .map_err(|error| operation_error(&task_home, "获取跨进程操作锁", error))?;
         provider_sync::recover_pending_state(&task_home)
@@ -126,7 +135,30 @@ async fn save_provider(
             progress.finish(2);
             notify_providers_changed(&app);
         }
-        Err(_) => fail_operation(&app, "save"),
+        Err(_) if started.load(Ordering::SeqCst) => fail_operation(&app, "save"),
+        Err(_) => {}
+    }
+    result
+}
+
+#[tauri::command]
+async fn refresh_provider_models(
+    app: AppHandle,
+    provider_id: String,
+) -> Result<ProviderState, String> {
+    let home = resolve_codex_home().map_err(resolve_home_error)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = acquire_app_operation()
+            .map_err(|error| operation_error(&home, "获取应用操作锁", error))?;
+        let _process_guard = operation_lock::acquire(&home)
+            .map_err(|error| operation_error(&home, "获取跨进程操作锁", error))?;
+        crate::app::refresh_provider_models_inner(&home, &provider_id)
+            .map_err(|error| operation_error(&home, "刷新模型列表", error))
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if result.is_ok() {
+        notify_providers_changed(&app);
     }
     result
 }
@@ -162,12 +194,14 @@ async fn set_keep_official_auth(app: AppHandle, enabled: bool) -> Result<Provide
         "关闭保留官方登录"
     };
     let progress = reporter(&app, "keep-auth", title);
-    progress.stage(0, 3, "准备更新", "正在保存鉴权方式并重新应用当前供应商。");
     let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
     let task_home = codex_home.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let task_started = started.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = acquire_app_operation()
             .map_err(|error| operation_error(&task_home, "获取应用操作锁", error))?;
+        task_started.store(true, Ordering::SeqCst);
         let _process_guard = operation_lock::acquire(&task_home)
             .map_err(|error| operation_error(&task_home, "获取跨进程操作锁", error))?;
         provider_sync::recover_pending_state(&task_home)
@@ -179,7 +213,8 @@ async fn set_keep_official_auth(app: AppHandle, enabled: bool) -> Result<Provide
     .map_err(|error| operation_error(&codex_home, "等待官方登录保留设置任务", error))?;
     match &result {
         Ok(_) => notify_providers_changed(&app),
-        Err(_) => fail_operation(&app, "keep-auth"),
+        Err(_) if started.load(Ordering::SeqCst) => fail_operation(&app, "keep-auth"),
+        Err(_) => {}
     }
     result
 }
@@ -213,14 +248,15 @@ async fn activate_provider_task(
     app: AppHandle,
     provider_id: String,
 ) -> Result<ProviderSyncReport, String> {
-    let progress = reporter(&app, "activate", "切换供应商");
-    progress.stage(0, 7, "准备切换", "正在获取操作锁并恢复未完成的操作。");
     let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
     let task_home = codex_home.clone();
     let handle = app.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let task_started = started.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _guard = acquire_app_operation()
             .map_err(|error| operation_error(&task_home, "获取应用操作锁", error))?;
+        task_started.store(true, Ordering::SeqCst);
         let _process_guard = operation_lock::acquire(&task_home)
             .map_err(|error| operation_error(&task_home, "获取跨进程操作锁", error))?;
         provider_sync::recover_pending_state(&task_home)
@@ -248,20 +284,25 @@ async fn activate_provider_task(
     .map_err(|error| operation_error(&codex_home, "等待供应商切换任务", error))?;
     match &result {
         Ok(_) => notify_providers_changed(&app),
-        Err(_) => fail_operation(&app, "activate"),
+        Err(_) if started.load(Ordering::SeqCst) => fail_operation(&app, "activate"),
+        Err(_) => {}
     }
     result
 }
 
 async fn start_official_login_task(app: AppHandle) -> Result<ProviderSyncReport, String> {
-    oauth::begin_login();
     let progress = reporter(&app, "official", "切换到官方登录");
-    progress.stage(0, 7, "准备切换", "正在获取操作锁并检查官方登录。");
     let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
+    let attempt = oauth::begin_login()
+        .map_err(|error| operation_error(&codex_home, "开始官方登录", error))?;
     let task_home = codex_home.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let task_started = started.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        let _attempt = attempt;
         let _guard = acquire_app_operation()
             .map_err(|error| operation_error(&task_home, "获取应用操作锁", error))?;
+        task_started.store(true, Ordering::SeqCst);
         let _process_guard = operation_lock::acquire(&task_home)
             .map_err(|error| operation_error(&task_home, "获取跨进程操作锁", error))?;
         provider_sync::recover_pending_state(&task_home)
@@ -275,7 +316,8 @@ async fn start_official_login_task(app: AppHandle) -> Result<ProviderSyncReport,
     .map_err(|error| operation_error(&codex_home, "等待官方登录任务", error))?;
     match &result {
         Ok(_) => notify_providers_changed(&app),
-        Err(_) => fail_operation(&app, "official"),
+        Err(_) if started.load(Ordering::SeqCst) => fail_operation(&app, "official"),
+        Err(_) => {}
     }
     result
 }

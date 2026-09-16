@@ -5,7 +5,7 @@ use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem}
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-use crate::app::list_provider_state;
+use crate::app::list_provider_state_read_only as list_provider_state;
 use crate::desktop::resolve_codex_home;
 
 pub const TRAY_ID: &str = "cswitch";
@@ -16,6 +16,16 @@ pub fn allow_exit() -> bool {
 }
 
 pub fn request_exit(app: &AppHandle) {
+    crate::oauth::cancel_login();
+    if crate::desktop::operation_in_progress() {
+        show_main_window(app);
+        use tauri::Emitter;
+        let _ = app.emit(
+            crate::progress::OPERATION_ERROR_EVENT,
+            "正在结束当前操作，请等待完成后再退出",
+        );
+        return;
+    }
     ALLOW_EXIT.store(true, Ordering::SeqCst);
     app.exit(0);
 }
