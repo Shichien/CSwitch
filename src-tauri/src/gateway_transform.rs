@@ -130,6 +130,35 @@ pub(crate) fn sanitize_responses_body(body: &mut Value) {
     sanitize_item_list(body.get_mut("output"));
 }
 
+/// Remove local rollout message IDs before an official Responses request.
+pub(crate) fn sanitize_official_responses_body(body: &mut Value) -> bool {
+    let Some(Value::Array(items)) = body.get_mut("input") else {
+        return false;
+    };
+    let mut changed = false;
+    for item in items {
+        let is_message = item.get("type").and_then(Value::as_str) == Some("message")
+            || (item.get("type").is_none()
+                && item.get("role").is_some()
+                && item.get("content").is_some());
+        if !is_message {
+            continue;
+        }
+        let invalid_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| !id.starts_with("msg"));
+        if invalid_id
+            && item.get("id").is_some()
+            && let Some(object) = item.as_object_mut()
+        {
+            object.remove("id");
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn sanitize_item_list(value: Option<&mut Value>) {
     let Some(Value::Array(items)) = value else {
         return;
@@ -1363,6 +1392,33 @@ mod tests {
                 .iter()
                 .all(|item| item["type"] != "reasoning")
         );
+    }
+
+    #[test]
+    fn sanitizes_official_message_ids_without_touching_other_item_namespaces() {
+        let mut body = json!({
+            "input": [
+                {"type": "message", "role": "assistant", "id": "item_local", "content": [{"type": "output_text", "text": "old"}]},
+                {"type": "message", "role": "assistant", "id": "msg_server", "content": [{"type": "output_text", "text": "keep"}]},
+                {"type": "function_call", "id": "fc_call", "call_id": "call_1", "name": "tool", "arguments": "{}"},
+                {"type": "reasoning", "id": "item_reasoning", "encrypted_content": "blob"}
+            ]
+        });
+        assert!(sanitize_official_responses_body(&mut body));
+        assert!(body["input"][0].get("id").is_none());
+        assert_eq!(body["input"][1]["id"], "msg_server");
+        assert_eq!(body["input"][2]["id"], "fc_call");
+        assert_eq!(body["input"][3]["id"], "item_reasoning");
+        assert!(!sanitize_official_responses_body(&mut body));
+    }
+
+    #[test]
+    fn sanitizes_message_ids_when_type_is_omitted() {
+        let mut body = json!({
+            "input": [{"role": "assistant", "id": "item_local", "content": [{"type": "output_text", "text": "old"}]}]
+        });
+        assert!(sanitize_official_responses_body(&mut body));
+        assert!(body["input"][0].get("id").is_none());
     }
 
     #[test]

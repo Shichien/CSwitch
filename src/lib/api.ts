@@ -28,6 +28,8 @@ export const cswitchApi = {
     invoke<void>("delete_provider", { providerId }),
   setKeepOfficialAuth: (enabled: boolean) =>
     invoke<ProviderState>("set_keep_official_auth", { enabled }),
+  addOfficialAccount: () => invoke<ProviderSyncReport>("add_official_account"),
+  activateOfficialAccount: (accountId: string) => invoke<ProviderSyncReport>("activate_official_account", { accountId }),
   startOfficialLogin: () =>
     invoke<ProviderSyncReport>("start_official_login"),
   cancelOfficialLogin: () => invoke<void>("cancel_official_login"),

@@ -14,7 +14,16 @@ export interface ProviderSummary {
   routingMode: "direct" | "local" | string;
 }
 
+export interface OfficialAccountSummary {
+  id: string;
+  label: string;
+  workspace: string;
+  active: boolean;
+  loginRetained: boolean;
+}
+
 export interface ProviderState {
+  officialAccounts: OfficialAccountSummary[];
   warnings: string[];
   providers: ProviderSummary[];
   activeProviderId: string | null;

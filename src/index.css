@@ -818,3 +818,19 @@ main {
     transition: none !important;
   }
 }
+
+.add-menu { position: relative; }
+.add-menu-options {
+  position: absolute; right: 0; top: calc(100% + 8px); min-width: 188px;
+  padding: 5px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--surface); box-shadow: var(--shadow);
+  animation: dialog-enter 140ms ease-out both;
+}
+.add-menu-options button {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 9px;
+  background: transparent; border: 0; border-radius: 7px; text-align: left; cursor: pointer;
+}
+.add-menu-options button:hover { background: var(--surface-muted); }
+.official-card .provider-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.official-card .provider-select > svg { flex-shrink: 0; }
+@media (prefers-reduced-motion: reduce) { .add-menu-options { animation: none; } }

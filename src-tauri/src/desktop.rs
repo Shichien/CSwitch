@@ -35,6 +35,8 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
             delete_provider,
             set_keep_official_auth,
             start_official_login,
+            add_official_account,
+            activate_official_account,
             cancel_official_login
         ])
         .setup(|app| {
@@ -63,13 +65,26 @@ pub(crate) fn handle_tray_menu(app: &AppHandle, id: &str) {
             tray::show_main_window(app);
             let handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = start_official_login_task(handle.clone()).await {
+                if let Err(error) =
+                    start_official_login_task(handle.clone(), OfficialAction::Default).await
+                {
                     report_tray_error(&handle, &error);
                 }
             });
         }
         other => {
-            if let Some(provider_id) = other.strip_prefix("provider:") {
+            if let Some(account_id) = other.strip_prefix("account:") {
+                tray::show_main_window(app);
+                let handle = app.clone();
+                let id = account_id.to_string();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) =
+                        start_official_login_task(handle.clone(), OfficialAction::Select(id)).await
+                    {
+                        report_tray_error(&handle, &error);
+                    }
+                });
+            } else if let Some(provider_id) = other.strip_prefix("provider:") {
                 tray::show_main_window(app);
                 let handle = app.clone();
                 let provider_id = provider_id.to_string();
@@ -248,7 +263,7 @@ fn delete_provider(app: AppHandle, provider_id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn start_official_login(app: AppHandle) -> Result<ProviderSyncReport, String> {
-    start_official_login_task(app).await
+    start_official_login_task(app, OfficialAction::Default).await
 }
 
 #[tauri::command]
@@ -302,8 +317,35 @@ async fn activate_provider_task(
     result
 }
 
-async fn start_official_login_task(app: AppHandle) -> Result<ProviderSyncReport, String> {
-    let progress = reporter(&app, "official", "切换到官方登录");
+enum OfficialAction {
+    Default,
+    Add,
+    Select(String),
+}
+
+#[tauri::command]
+async fn add_official_account(app: AppHandle) -> Result<ProviderSyncReport, String> {
+    start_official_login_task(app, OfficialAction::Add).await
+}
+
+#[tauri::command]
+async fn activate_official_account(
+    app: AppHandle,
+    account_id: String,
+) -> Result<ProviderSyncReport, String> {
+    start_official_login_task(app, OfficialAction::Select(account_id)).await
+}
+
+async fn start_official_login_task(
+    app: AppHandle,
+    action: OfficialAction,
+) -> Result<ProviderSyncReport, String> {
+    let title = if matches!(action, OfficialAction::Add) {
+        "添加官方账号"
+    } else {
+        "切换官方账号"
+    };
+    let progress = reporter(&app, "official", title);
     let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
     let attempt = oauth::begin_login()
         .map_err(|error| operation_error(&codex_home, "开始官方登录", error))?;
@@ -321,8 +363,14 @@ async fn start_official_login_task(app: AppHandle) -> Result<ProviderSyncReport,
             .map_err(|error| operation_error(&task_home, "恢复上次未完成的操作", error))?;
         ensure_provider_migration(&task_home)
             .map_err(|error| operation_error(&task_home, "迁移已有供应商", error))?;
-        switch_to_official_with_progress(&task_home, &progress)
-            .map_err(|error| operation_error(&task_home, "恢复官方登录", error))
+        match action {
+            OfficialAction::Default => switch_to_official_with_progress(&task_home, &progress),
+            OfficialAction::Add => crate::app::add_official_account(&task_home, &progress),
+            OfficialAction::Select(id) => {
+                crate::app::switch_official_account(&task_home, &id, &progress)
+            }
+        }
+        .map_err(|error| operation_error(&task_home, title, error))
     })
     .await
     .map_err(|error| operation_error(&codex_home, "等待官方登录任务", error))?;

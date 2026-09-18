@@ -168,12 +168,23 @@ pub fn ensure_login_active() -> Result<(), Box<dyn Error>> {
 }
 
 pub fn browser_login() -> Result<Vec<u8>, Box<dyn Error>> {
+    browser_login_with_account_prompt(false)
+}
+
+pub(crate) fn browser_login_new_account() -> Result<Vec<u8>, Box<dyn Error>> {
+    browser_login_with_account_prompt(true)
+}
+
+fn browser_login_with_account_prompt(new_account: bool) -> Result<Vec<u8>, Box<dyn Error>> {
     ensure_login_active()?;
     let (server, port) = bind_callback_server()?;
     let redirect_uri = format!("http://localhost:{port}/auth/callback");
     let pkce = generate_pkce();
     let state = random_urlsafe(32);
-    let auth_url = build_authorize_url(&redirect_uri, &pkce.challenge, &state)?;
+    let mut auth_url = build_authorize_url(&redirect_uri, &pkce.challenge, &state)?;
+    if new_account {
+        auth_url.query_pairs_mut().append_pair("prompt", "login");
+    }
 
     ensure_login_active()?;
     webbrowser::open(auth_url.as_str()).map_err(|error| format!("打开登录页面失败：{error}"))?;

@@ -158,6 +158,15 @@ impl ProfileStore {
     }
 
     pub fn save_official(&self, config: &[u8], auth: &[u8]) -> Result<(), Box<dyn Error>> {
+        if crate::official_accounts::identity(auth).is_some() {
+            let home = self.root.parent().ok_or("官方快照缺少父目录")?;
+            let accounts = crate::official_accounts::Store::new(home);
+            if read_optional(&home.join("auth.json"))?.as_deref() == Some(auth) {
+                accounts.sync_live(auth)?;
+            } else {
+                accounts.save(auth)?;
+            }
+        }
         let directory = self.official_dir();
         create_private_dir(&directory)?;
         ensure_legacy_pair_committed(&directory)?;

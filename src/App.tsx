@@ -5,6 +5,7 @@ import {
   LoaderCircle,
   LogIn,
   Plus,
+  KeyRound,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -13,6 +14,7 @@ import { ProviderCard } from "./components/ProviderCard";
 import { ProviderDialog } from "./components/ProviderDialog";
 import { cswitchApi } from "./lib/api";
 import type {
+  OfficialAccountSummary,
   OperationProgress,
   ProviderDraft,
   ProviderState,
@@ -24,6 +26,7 @@ import type {
 const EMPTY_STATE: ProviderState = {
   warnings: [],
   providers: [],
+  officialAccounts: [],
   activeProviderId: null,
   officialActive: false,
   keepOfficialAuth: false,
@@ -48,6 +51,8 @@ function App() {
   const [state, setState] = useState<ProviderState>(EMPTY_STATE);
   const [busy, setBusy] = useState<BusyAction>("load");
   const [notice, setNotice] = useState<Notice>(null);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const addMenuRef = useRef<HTMLDivElement>(null);
   const [providerDialogOpen, setProviderDialogOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<ProviderSummary | null>(null);
   const [routingProvider, setRoutingProvider] = useState<ProviderSummary | null>(null);
@@ -140,6 +145,7 @@ function App() {
   }, [refresh, showNotice]);
 
   const openAdd = () => {
+    setAddMenuOpen(false);
     setEditingProvider(null);
     setProviderDialogOpen(true);
   };
@@ -275,24 +281,28 @@ function App() {
     }
   };
 
-  const useOfficial = async () => {
+  const useOfficial = async (account?: OfficialAccountSummary, adding = false) => {
     if (!beginAction()) return;
+    setAddMenuOpen(false);
     officialCancelled.current = false;
     setBusy("official");
     setProgress({
       operation: "official",
-      title: "切换到官方登录",
-      stage: "准备切换",
-      detail: "正在检查官方登录状态。",
+      title: adding ? "添加官方账号" : `切换到 ${account?.label ?? "官方登录"}`,
+      stage: adding ? "准备登录" : "准备切换",
+      detail: adding ? "请在浏览器登录要添加的账号，当前线路保持不变。" : "正在检查选中的官方账号。",
       current: 0,
       total: 7,
       done: false,
     });
     try {
-      const report = await cswitchApi.startOfficialLogin();
+      const report = adding ? await cswitchApi.addOfficialAccount()
+        : account ? await cswitchApi.activateOfficialAccount(account.id)
+        : await cswitchApi.startOfficialLogin();
       await refresh();
-      if (officialCancelled.current) showNotice("success", "切换已经完成，取消请求到达时操作已提交");
-      else reportSuccess("官方登录", report);
+      if (officialCancelled.current) showNotice("success", "操作已经完成，取消请求到达时已提交");
+      else if (adding) showNotice("success", "账号已保存；重复登录会更新同一账号，点击卡片切换");
+      else reportSuccess(account?.label ?? "官方登录", report);
     } catch (error) {
       const message = errorText(error);
       if (!officialCancelled.current && message !== "官方登录已取消") showNotice("error", message);
@@ -336,6 +346,25 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    if (!addMenuOpen) return;
+    const outside = (event: PointerEvent) => {
+      if (!addMenuRef.current?.contains(event.target as Node)) setAddMenuOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAddMenuOpen(false);
+        addMenuRef.current?.querySelector<HTMLButtonElement>(".add-button")?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [addMenuOpen]);
+
   const isLoading = busy === "load";
   const locked = Boolean(busy) || Boolean(progress);
   const hasDialog = providerDialogOpen || Boolean(routingProvider) || Boolean(deletingProvider) || Boolean(progress);
@@ -358,7 +387,7 @@ function App() {
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [isLoading, state.providers.length, hasDialog, showNotice]);
+  }, [isLoading, state.providers.length, state.officialAccounts.length, hasDialog, showNotice]);
 
   const percent = progress && progress.total > 0
     ? Math.min(100, Math.round((progress.current / progress.total) * 100))
@@ -414,15 +443,43 @@ function App() {
             </div>
           </details>
         </div>
-        <button className="add-button" type="button" aria-label="添加供应商" title="添加供应商" disabled={locked} onClick={openAdd}>
-          <Plus size={19} />
-        </button>
+        <div ref={addMenuRef} className="add-menu" onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) setAddMenuOpen(false);
+        }}>
+          <button className="add-button" type="button" aria-label="添加账号或供应商" title="添加"
+            aria-expanded={addMenuOpen} aria-controls="add-options" disabled={locked}
+            onClick={() => setAddMenuOpen((open) => !open)}>
+            <Plus size={19} />
+          </button>
+          {addMenuOpen && (
+            <div id="add-options" className="add-menu-options" role="group" aria-label="添加类型">
+              <button type="button" onClick={openAdd}><KeyRound size={17} />添加 API 供应商</button>
+              <button type="button" onClick={() => void useOfficial(undefined, true)}><CircleUserRound size={17} />添加官方账号</button>
+            </div>
+          )}
+        </div>
       </header>
 
       <main>
-        <section aria-label="官方登录">
-          <article className={`provider-card official-card${state.officialActive ? " active" : ""}`}>
-            <button className="provider-select" type="button" disabled={locked} onClick={useOfficial}>
+        <section className="provider-list" aria-label="官方账号列表">
+          {state.officialAccounts.map((account) => (
+            <article key={account.id} className={`provider-card official-card${account.active ? " active" : ""}`}>
+              <button className="provider-select" type="button" disabled={locked} onClick={() => void useOfficial(account)}
+                aria-label={`切换到官方账号 ${account.label} ${account.workspace}`}>
+                <span className="provider-icon official-icon" aria-hidden="true"><CircleUserRound size={20} /></span>
+                <span className="provider-copy">
+                  <span className="provider-title-row"><strong title={account.label}>{account.label}</strong>
+                    {account.active && <span className="active-badge"><Check size={12} />当前</span>}
+                  </span>
+                  <span className="provider-meta"><span title={account.workspace}>ChatGPT · {account.workspace.slice(0, 8)}{!account.active && account.loginRetained ? " · 登录已保留" : ""}</span>
+                  </span>
+                </span>
+                <LogIn size={18} />
+              </button>
+            </article>
+          ))}
+          {state.officialAccounts.length === 0 && <article className={`provider-card official-card${state.officialActive ? " active" : ""}`}>
+            <button className="provider-select" type="button" disabled={locked} onClick={() => void useOfficial()}>
               <span className="provider-icon official-icon" aria-hidden="true">
                 <CircleUserRound size={20} />
               </span>
@@ -442,8 +499,7 @@ function App() {
                 <button className="cancel-login-button" type="button" onClick={cancelOfficial}>取消</button>
               </div>
             )}
-          </article>
-
+          </article>}
         </section>
 
         <section className="provider-list" aria-label="API 供应商列表" aria-busy={isLoading}>

@@ -38,6 +38,7 @@ pub(crate) struct ProviderSummary {
 pub(crate) struct ProviderState {
     pub(crate) warnings: Vec<String>,
     pub(crate) providers: Vec<ProviderSummary>,
+    pub(crate) official_accounts: Vec<crate::official_accounts::Summary>,
     pub(crate) active_provider_id: Option<String>,
     pub(crate) official_active: bool,
     pub(crate) keep_official_auth: bool,
@@ -54,6 +55,7 @@ pub(crate) struct SavedProvider {
 
 pub(crate) fn list_provider_state(codex_home: &Path) -> Result<ProviderState, Box<dyn Error>> {
     ensure_provider_migration(codex_home)?;
+    sync_official_accounts(codex_home)?;
     let mut state = list_provider_state_read_only(codex_home)?;
     if let Err(error) = ProfileStore::new(codex_home).cleanup() {
         state.warnings.push(format!(
@@ -119,7 +121,25 @@ pub(crate) fn list_provider_state_read_only(
     {
         warnings.push(reason);
     }
+    let live_identity = read_optional_file(&codex_home.join("auth.json"))?
+        .as_deref()
+        .and_then(crate::official_accounts::identity);
+    let official_accounts = crate::official_accounts::Store::new(codex_home)
+        .list()?
+        .into_iter()
+        .map(|a| {
+            let retained = live_identity.as_ref() == Some(&a.identity);
+            crate::official_accounts::Summary {
+                id: a.id,
+                label: a.label,
+                workspace: a.identity.account,
+                active: official_active && retained,
+                login_retained: retained,
+            }
+        })
+        .collect();
     Ok(ProviderState {
+        official_accounts,
         warnings,
         providers,
         active_provider_id,
@@ -1325,3 +1345,193 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+pub(crate) fn sync_official_accounts(home: &Path) -> Result<(), Box<dyn Error>> {
+    let accounts = crate::official_accounts::Store::new(home);
+    if let Some(legacy) = ProfileStore::new(home).load_official()? {
+        accounts.import_legacy(&legacy.auth)?;
+    }
+    if let Some(live) = read_optional_file(&home.join("auth.json"))? {
+        accounts.sync_live(&live)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn add_official_account(
+    home: &Path,
+    progress: &ProgressReporter,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    add_official_account_with(home, progress, oauth::browser_login_new_account)
+}
+
+fn add_official_account_with<L>(
+    home: &Path,
+    progress: &ProgressReporter,
+    login: L,
+) -> Result<ProviderSyncReport, Box<dyn Error>>
+where
+    L: FnOnce() -> Result<Vec<u8>, Box<dyn Error>>,
+{
+    sync_official_accounts(home)?;
+    progress.stage(
+        1,
+        2,
+        "添加官方账号",
+        "请在浏览器登录要添加的账号。当前线路保持不变，也可以点击取消。",
+    );
+    oauth::ensure_login_active()?;
+    let auth = login()?;
+    oauth::ensure_login_active()?;
+    crate::official_accounts::Store::new(home).save(&auth)?;
+    progress.finish(2);
+    Ok(empty_route_report())
+}
+
+pub(crate) fn switch_official_account(
+    home: &Path,
+    id: &str,
+    progress: &ProgressReporter,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    switch_official_account_with(
+        home,
+        id,
+        progress,
+        codex_process::close_if_running,
+        |auth| select_official_auth(&[auth.to_vec()]),
+    )
+}
+
+fn switch_official_account_with<C, V>(
+    home: &Path,
+    id: &str,
+    progress: &ProgressReporter,
+    close: C,
+    validate: V,
+) -> Result<ProviderSyncReport, Box<dyn Error>>
+where
+    C: FnOnce() -> Result<bool, Box<dyn Error>>,
+    V: FnOnce(&[u8]) -> Result<Option<Vec<u8>>, Box<dyn Error>>,
+{
+    let accounts = crate::official_accounts::Store::new(home);
+    let selected = accounts.load(id)?;
+    let profiles = ProfileStore::new(home);
+    let settings = profiles.load_settings()?;
+    let live = read_optional_file(&home.join("auth.json"))?;
+    if let Some(live) = live.as_deref() {
+        accounts.sync_live(live)?;
+        // Same account and same credentials: this is just an outlet change.
+        if settings.official_route.is_some()
+            && crate::official_accounts::identity(live).is_some()
+            && accounts.load(id)?.auth == serde_json::from_slice::<serde_json::Value>(live)?
+        {
+            return activate_official_route_with_close(home, "openai", progress, close);
+        }
+    }
+    oauth::ensure_login_active()?;
+    progress.stage(
+        1,
+        3,
+        "切换官方账号",
+        "正在关闭 Codex，保存当前账号最后更新的凭据。",
+    );
+    close()?;
+    oauth::ensure_login_active()?;
+    let original = read_optional_file(&home.join("config.toml"))?;
+    let original_auth = read_optional_file(&home.join("auth.json"))?;
+    let text = std::str::from_utf8(original.as_deref().unwrap_or_default())?;
+    let mut settings = profiles.load_settings()?;
+    if let Some(route) = &settings.official_route {
+        verify_route_config(text, route)?;
+    }
+    if let Some(live) = original_auth.as_deref() {
+        accounts.sync_live(live)?;
+    }
+    let current = accounts.load(id)?;
+    let candidate = serde_json::to_vec_pretty(&current.auth)?;
+    progress.stage(
+        2,
+        3,
+        "检查选中账号",
+        "只验证这个账号；失效时请重新添加该账号。",
+    );
+    let auth = validate(&candidate)?.ok_or("这个官方账号的登录已失效，请通过加号重新添加该账号")?;
+    if crate::official_accounts::identity(&auth).as_ref() != Some(&selected.identity) {
+        return Err("认证返回的账号与选中账号不一致，已停止切换".into());
+    }
+    // A refresh token may already be rotated. Save it before any cancellable work.
+    accounts.save(&auth)?;
+    oauth::ensure_login_active()?;
+    if read_optional_file(&home.join("auth.json"))? != original_auth {
+        return Err("切换期间 auth.json 已被其他程序修改，已保留双方凭据，请重试".into());
+    }
+    let mut report = if let Some(route) = settings.official_route.as_mut() {
+        if route.resident && route.http_transport.is_some() {
+            let prepared = gateway::prepare_resident(
+                home,
+                "openai",
+                gateway::route_port(&route.local_base_url)?,
+            )?;
+            route.provider_id = "openai".into();
+            let mut report = provider_sync::apply_route_state(
+                home,
+                original.as_deref(),
+                text.as_bytes(),
+                None,
+                AuthUpdate::Replace(&auth),
+                &serde_json::to_vec_pretty(&settings)?,
+            )?;
+            report.warnings.extend(prepared.commit());
+            report
+        } else {
+            return Err("请先用当前账号升级旧版本地路由，再切换其他官方账号".into());
+        }
+    } else {
+        if let Some(active) =
+            detect_active_provider_id(home, &profiles, &profiles.list_providers()?)?
+        {
+            snapshot_provider_without_clobbering_key(
+                &profiles,
+                &active,
+                original.as_deref().unwrap_or_default(),
+            )?;
+        }
+        let config = if is_official_config(text)? {
+            text.as_bytes().to_vec()
+        } else if let Some(saved) = profiles.load_official_config()?.filter(|b| !b.is_empty()) {
+            build_official_config(std::str::from_utf8(&saved)?)?.into_bytes()
+        } else {
+            build_official_config(text)?.into_bytes()
+        };
+        activate_official(home, original.as_deref(), &config, &auth)?
+    };
+    // The live-file transaction is committed. Snapshot/cleanup errors are warnings,
+    // never report a failed switch after the selected account is already active.
+    let snapshot = (|| -> Result<(), Box<dyn Error>> {
+        accounts.mark_live(&auth)?;
+        let live_config = fs::read_to_string(home.join("config.toml"))?;
+        profiles.save_official(
+            official_snapshot_config(&live_config, &profiles)?.as_bytes(),
+            &auth,
+        )
+    })();
+    if let Err(e) = snapshot {
+        report
+            .warnings
+            .push(format!("账号已切换，保存快照失败：{e}"));
+    }
+    if settings.official_route.is_none()
+        && let Err(e) = gateway::stop(home)
+    {
+        report
+            .warnings
+            .push(format!("账号已切换，旧路由清理失败：{e}"));
+    }
+    report
+        .warnings
+        .push("已切换官方账号，请重新打开 Codex。".into());
+    progress.finish(3);
+    Ok(report)
+}
+
+#[cfg(test)]
+#[path = "multi_account_tests.rs"]
+mod multi_account_tests;

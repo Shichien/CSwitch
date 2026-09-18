@@ -128,7 +128,36 @@ fn build_menu(app: &AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn Error>> {
         None => Vec::new(),
     };
 
-    let mut entries: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&show, &top_sep, &official];
+    let account_items = state
+        .as_ref()
+        .map(|s| {
+            s.official_accounts
+                .iter()
+                .map(|a| {
+                    CheckMenuItem::with_id(
+                        app,
+                        format!("account:{}", a.id),
+                        format!(
+                            "{} · {}",
+                            a.label,
+                            a.workspace.chars().take(8).collect::<String>()
+                        ),
+                        true,
+                        a.active,
+                        None::<&str>,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut entries: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&show, &top_sep];
+    if account_items.is_empty() {
+        entries.push(&official);
+    }
+    for item in &account_items {
+        entries.push(item);
+    }
     for item in &provider_items {
         entries.push(item);
     }

@@ -703,6 +703,14 @@ async fn inference(
         bytes
     };
     if data.target.protocol() == "openai_responses" {
+        let bytes = if data.target.is_official() {
+            match sanitize_official_request(&mut headers, bytes) {
+                Ok(bytes) => bytes,
+                Err(reason) => return error(400, &reason),
+            }
+        } else {
+            bytes
+        };
         return match passthrough(data, uri.path(), headers, bytes).await {
             Ok(response) => response,
             Err(reason) => error(502, &reason),
@@ -715,6 +723,33 @@ async fn inference(
         Ok(response) => response,
         Err(message) => error(502, &message),
     }
+}
+
+fn sanitize_official_request(headers: &mut HeaderMap, bytes: Bytes) -> Result<Bytes, String> {
+    let original = bytes.clone();
+    let decoded = if let Some(encoding) = headers.get("content-encoding") {
+        if encoding == "zstd" {
+            match decode_request_body(encoding, bytes) {
+                Ok(decoded) => decoded,
+                Err(_) => return Ok(original),
+            }
+        } else {
+            return Ok(original);
+        }
+    } else {
+        bytes
+    };
+    let Ok(mut body) = serde_json::from_slice::<Value>(&decoded) else {
+        return Ok(original);
+    };
+    if !gateway_transform::sanitize_official_responses_body(&mut body) {
+        return Ok(original);
+    }
+    headers.remove("content-encoding");
+    headers.remove("content-length");
+    serde_json::to_vec(&body)
+        .map(Bytes::from)
+        .map_err(|_| "修复官方历史消息 ID 失败".to_string())
 }
 
 fn decode_request_body(encoding: &axum::http::HeaderValue, bytes: Bytes) -> Result<Bytes, String> {
@@ -736,6 +771,65 @@ fn decode_request_body(encoding: &axum::http::HeaderValue, bytes: Bytes) -> Resu
         return Err("解压后的请求体超过 32 MiB".into());
     }
     Ok(Bytes::from(result))
+}
+
+#[cfg(test)]
+mod official_request_tests {
+    use super::*;
+
+    #[test]
+    fn removes_invalid_local_message_ids_and_preserves_other_ids() {
+        let mut headers = HeaderMap::new();
+        let body = serde_json::to_vec(&json!({
+            "model": "fixture",
+            "input": [
+                {"type": "message", "role": "assistant", "id": "item_local", "content": [{"type": "output_text", "text": "old"}]},
+                {"type": "function_call", "id": "fc_keep", "call_id": "call_1", "name": "tool", "arguments": "{}"}
+            ]
+        })).unwrap();
+        let result = sanitize_official_request(&mut headers, Bytes::from(body)).unwrap();
+        let result: Value = serde_json::from_slice(&result).unwrap();
+        assert!(result["input"][0].get("id").is_none());
+        assert_eq!(result["input"][1]["id"], "fc_keep");
+        assert!(headers.get("content-encoding").is_none());
+    }
+
+    #[test]
+    fn repairs_zstd_requests_and_removes_stale_encoding_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-encoding",
+            axum::http::HeaderValue::from_static("zstd"),
+        );
+        let plain = serde_json::to_vec(&json!({
+            "input": [{"type": "message", "role": "assistant", "id": "item_local", "content": [{"type": "output_text", "text": "old"}]}]
+        })).unwrap();
+        let compressed = zstd::stream::encode_all(plain.as_slice(), 0).unwrap();
+        let result = sanitize_official_request(&mut headers, Bytes::from(compressed)).unwrap();
+        let result: Value = serde_json::from_slice(&result).unwrap();
+        assert!(result["input"][0].get("id").is_none());
+        assert!(headers.get("content-encoding").is_none());
+        assert!(headers.get("content-length").is_none());
+    }
+
+    #[test]
+    fn leaves_non_json_and_unknown_encodings_unchanged() {
+        let original = Bytes::from_static(b"not-json");
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            sanitize_official_request(&mut headers, original.clone()).unwrap(),
+            original
+        );
+        headers.insert(
+            "content-encoding",
+            axum::http::HeaderValue::from_static("gzip"),
+        );
+        assert_eq!(
+            sanitize_official_request(&mut headers, original.clone()).unwrap(),
+            original
+        );
+        assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
+    }
 }
 
 #[cfg(test)]
