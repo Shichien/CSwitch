@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "CSwitch desktop permissions",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-set-size"]
 }

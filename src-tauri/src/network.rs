@@ -19,7 +19,8 @@ pub(crate) fn blocking_builder(
 pub(crate) fn async_builder() -> Result<reqwest::ClientBuilder, Box<dyn Error>> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(120))
+        // Codex owns the response idle deadline. A relay must not truncate a valid
+        // long reasoning stream using a shorter, independent read timeout.
         .redirect(reqwest::redirect::Policy::none());
     if let Some(proxy) = desktop_proxy()? {
         builder = builder.proxy(proxy);

@@ -17,7 +17,9 @@ pub(crate) fn close_if_running() -> Result<bool, Box<dyn Error>> {
     if cfg!(test) {
         return Ok(false);
     }
+    crate::oauth::ensure_login_active()?;
     let closed = platform::close_if_running()?;
+    crate::oauth::ensure_login_active()?;
     assert_no_other_writers()?;
     Ok(closed)
 }
@@ -102,24 +104,29 @@ mod platform {
     use std::error::Error;
     use std::ffi::c_void;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
     use std::thread;
     use std::time::Instant;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
     };
 
-    #[derive(Clone, Copy)]
     struct Process {
         pid: u32,
+        executable: PathBuf,
+        created: u64,
+        handle: OwnedHandle,
     }
 
     struct OwnedHandle(HANDLE);
@@ -139,31 +146,19 @@ mod platform {
         }
 
         close_windows(&processes)?;
-        if wait_until_closed(CLOSE_TIMEOUT)? {
+        if wait_until_closed(&processes, CLOSE_TIMEOUT)? {
             return Ok(true);
         }
 
         let mut force_close_errors = Vec::new();
-        for process in find_codex_processes()? {
-            match Command::new("taskkill")
-                .args(["/PID", &process.pid.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
-            {
-                Ok(output) if output.status.success() => {}
-                Ok(output) => force_close_errors.push(format!(
-                    "进程 {}：{}",
-                    process.pid,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )),
-                Err(error) => {
-                    force_close_errors.push(format!("进程 {}：{error}", process.pid));
-                }
+        for process in &processes {
+            crate::oauth::ensure_login_active()?;
+            if let Err(error) = terminate_verified_process(process) {
+                force_close_errors.push(error.to_string());
             }
         }
-        if !wait_until_closed(CLOSE_TIMEOUT)? {
-            let pids = find_codex_processes()?
+        if !wait_until_closed(&processes, CLOSE_TIMEOUT)? {
+            let pids = processes
                 .iter()
                 .map(|process| process.pid.to_string())
                 .collect::<Vec<_>>()
@@ -202,41 +197,138 @@ mod platform {
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
             if (name.eq_ignore_ascii_case("Codex.exe") || name.eq_ignore_ascii_case("ChatGPT.exe"))
-                && let Some(executable) = process_image_path(entry.th32ProcessID)?
-                && is_codex_desktop_process(&name, &executable)
+                && let Some(process) = process_identity(entry.th32ProcessID)?
+                && is_codex_desktop_process(&name, &process.executable)
             {
-                found.push(Process {
-                    pid: entry.th32ProcessID,
-                });
+                found.push(process);
             }
             has_entry = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
         }
         Ok(found)
     }
 
-    fn process_image_path(pid: u32) -> Result<Option<PathBuf>, Box<dyn Error>> {
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    fn process_identity(pid: u32) -> Result<Option<Process>, Box<dyn Error>> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
         if handle.is_null() {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(87) {
                 return Ok(None);
             }
-            return Err(format!("读取 Codex 进程 {pid} 路径失败：{error}").into());
+            return Err(format!("读取 Codex 进程 {pid} 失败：{error}").into());
         }
         let handle = OwnedHandle(handle);
+        if has_exited(&handle)? {
+            return Ok(None);
+        }
+        match handle_identity(&handle, pid) {
+            Ok((executable, created)) => Ok(Some(Process {
+                pid,
+                handle,
+                executable,
+                created,
+            })),
+            Err(_) if has_exited(&handle)? => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn has_exited(handle: &OwnedHandle) -> Result<bool, Box<dyn Error>> {
+        match unsafe { WaitForSingleObject(handle.0, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(format!(
+                "检查 Codex 退出状态失败：{}",
+                std::io::Error::last_os_error()
+            )
+            .into()),
+        }
+    }
+
+    fn handle_identity(handle: &OwnedHandle, pid: u32) -> Result<(PathBuf, u64), Box<dyn Error>> {
         let mut buffer = vec![0u16; 32_768];
         let mut length = buffer.len() as u32;
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
         if unsafe { QueryFullProcessImageNameW(handle.0, 0, buffer.as_mut_ptr(), &mut length) } == 0
+            || unsafe {
+                GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user)
+            } == 0
         {
             return Err(format!(
-                "查询 Codex 进程 {pid} 路径失败：{}",
+                "查询 Codex 进程 {pid} 身份失败：{}",
                 std::io::Error::last_os_error()
             )
             .into());
         }
-        Ok(Some(PathBuf::from(String::from_utf16_lossy(
-            &buffer[..length as usize],
-        ))))
+        Ok((
+            PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize])),
+            ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64,
+        ))
+    }
+
+    fn terminate_verified_process(process: &Process) -> Result<(), Box<dyn Error>> {
+        if has_exited(&process.handle)? {
+            return Ok(());
+        }
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                0,
+                process.pid,
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            if has_exited(&process.handle)? {
+                return Ok(());
+            }
+            return Err(format!("打开待关闭 Codex 进程 {} 失败：{error}", process.pid).into());
+        }
+        let handle = OwnedHandle(handle);
+        if unsafe { WaitForSingleObject(handle.0, 0) } == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+        let (path, created) = handle_identity(&handle, process.pid)?;
+        if path != process.executable || created != process.created {
+            return Err(format!("Codex 进程 {} 已发生变化，保留新进程", process.pid).into());
+        }
+        // Terminate the verified handle, not a shell command or a subsequently reused PID.
+        if unsafe { TerminateProcess(handle.0, 1) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if has_exited(&process.handle)? {
+                return Ok(());
+            }
+            return Err(format!("系统拒绝关闭 Codex 进程 {}：{}", process.pid, error).into());
+        }
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        loop {
+            crate::oauth::ensure_login_active()?;
+            let status = unsafe { WaitForSingleObject(handle.0, 100) };
+            if status == WAIT_OBJECT_0 {
+                return Ok(());
+            }
+            if status != WAIT_TIMEOUT {
+                return Err(format!(
+                    "等待 Codex 进程 {} 退出失败：{}",
+                    process.pid,
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("等待 Codex 进程 {} 退出超时", process.pid).into());
+            }
+        }
     }
 
     struct WindowTargets<'a> {
@@ -275,16 +367,65 @@ mod platform {
         Ok(())
     }
 
-    fn wait_until_closed(timeout: std::time::Duration) -> Result<bool, Box<dyn Error>> {
+    fn wait_until_closed(
+        processes: &[Process],
+        timeout: std::time::Duration,
+    ) -> Result<bool, Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         loop {
-            if find_codex_processes()?.is_empty() {
+            crate::oauth::ensure_login_active()?;
+            // Keep the original kernel handles: do not reopen dying processes by PID on every poll.
+            if processes
+                .iter()
+                .map(|p| has_exited(&p.handle))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .all(|exited| exited)
+            {
                 return Ok(true);
             }
             if Instant::now() >= deadline {
                 return Ok(false);
             }
             thread::sleep(POLL_INTERVAL);
+        }
+    }
+    #[cfg(test)]
+    mod native_process_tests {
+        use super::*;
+        #[test]
+        fn child_fixture() {
+            if std::env::var_os("CSWITCH_NATIVE_CLOSE_FIXTURE").is_some() {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+            }
+        }
+        #[test]
+        #[ignore = "isolated native child process; run scripts/run-process-tests.py"]
+        fn native_close_verifies_identity_and_terminates_without_external_commands() {
+            use std::os::windows::process::CommandExt;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "codex_process::platform::native_process_tests::child_fixture",
+                ])
+                .env("CSWITCH_NATIVE_CLOSE_FIXTURE", "1")
+                .creation_flags(0x08000000)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut process = process_identity(child.id()).unwrap().unwrap();
+            let created = process.created;
+            process.created += 1;
+            assert!(terminate_verified_process(&process).is_err());
+            assert!(child.try_wait().unwrap().is_none());
+            process.created = created;
+            terminate_verified_process(&process).unwrap();
+            assert!(!child.wait().unwrap().success());
+            assert!(wait_until_closed(std::slice::from_ref(&process), CLOSE_TIMEOUT).unwrap());
+            // Child retains its handle after exit. It must not be queried/terminated a second time.
+            assert!(process_identity(child.id()).unwrap().is_none());
+            terminate_verified_process(&process).unwrap();
         }
     }
 }
@@ -362,6 +503,7 @@ mod platform {
     fn wait_until_closed(timeout: std::time::Duration) -> Result<bool, Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         loop {
+            crate::oauth::ensure_login_active()?;
             if find_codex_processes()?.is_empty() {
                 return Ok(true);
             }
@@ -446,6 +588,7 @@ mod platform {
     fn wait_until_closed(timeout: std::time::Duration) -> Result<bool, Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         loop {
+            crate::oauth::ensure_login_active()?;
             if find_codex_processes()?.is_empty() {
                 return Ok(true);
             }

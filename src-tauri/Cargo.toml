@@ -1,6 +1,6 @@
 [package]
 name = "cswitch"
-version = "0.1.7"
+version = "0.1.11"
 edition = "2024"
 license = "MIT"
 description = "Codex provider switcher"
@@ -9,10 +9,11 @@ description = "Codex provider switcher"
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.29"
 async-stream = "0.3"
 futures-util = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "fs"] }
 sysinfo = "0.37"
 tauri-plugin-single-instance = "2"
 base64 = "0.22.1"
@@ -30,6 +31,7 @@ tiny_http = "0.12.0"
 toml_edit = "0.23.7"
 url = "2.5.7"
 webbrowser = "1.0.6"
+zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

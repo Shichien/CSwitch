@@ -2,25 +2,24 @@ use serde::Serialize;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
-use toml_edit::Item;
 
 use crate::{
-    codex_process, config, gateway, model_catalog, oauth, profiles, progress, provider_sync,
-    upstream,
+    codex_process, config, gateway, model_catalog, oauth, profiles, progress, provider_import,
+    provider_sync, upstream,
 };
+#[cfg(test)]
+use config::build_provider_config;
 use config::{
-    api_key_from_auth, build_custom_auth, build_official_config, build_provider_config,
-    config_selects_custom, custom_bearer_token, custom_provider, is_official_config,
-    normalize_api_url, parse_config, validate_api_key, validate_provider_name,
+    api_key_from_auth, build_custom_auth, build_official_config, custom_bearer_token,
+    is_official_config, normalize_api_url, parse_config, validate_api_key, validate_provider_name,
     verify_provider_content,
 };
 use oauth::{AuthHealth, LocalAuthState};
-use profiles::{AppSettings, ProfileStore, ProviderRecord};
+use profiles::{ProfileStore, ProviderRecord};
 use progress::ProgressReporter;
 use provider_sync::{AuthUpdate, ProviderSyncReport};
 
 const PROVIDER_ID: &str = "custom";
-const OFFICIAL_PROVIDER_ID: &str = "openai";
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderSummary {
@@ -74,7 +73,17 @@ pub(crate) fn list_provider_state_read_only(
     let config = read_optional_file(&codex_home.join("config.toml"))?;
     let official_config =
         is_official_config(std::str::from_utf8(config.as_deref().unwrap_or_default())?)?;
-    let official_active = if official_config {
+    let route = profiles.load_settings()?.official_route;
+    let route_is_official = route.as_ref().is_some_and(|r| {
+        r.provider_id == "openai"
+            && verify_route_config(
+                std::str::from_utf8(config.as_deref().unwrap_or_default()).unwrap_or_default(),
+                r,
+            )
+            .is_ok()
+    });
+    let official_active = if (official_config && active_provider_id.is_none()) || route_is_official
+    {
         read_optional_file(&codex_home.join("auth.json"))?
             .as_deref()
             .is_some_and(|auth| oauth::inspect_auth(auth) != LocalAuthState::Invalid)
@@ -95,8 +104,23 @@ pub(crate) fn list_provider_state_read_only(
             routing_mode: record.routing_mode,
         });
     }
+    let mut warnings = Vec::new();
+    if route.as_ref().is_some_and(|r| r.http_transport.is_none()) {
+        warnings.push(
+            "当前路由仍使用旧版传输设置，请点击当前线路应用 HTTP/SSE 配置，再重新打开 Codex".into(),
+        );
+    }
+    if route.is_none()
+        && let Some(config) = config.as_deref()
+        && let provider_import::Inspection::NeedsInput(reason) = provider_import::inspect(
+            std::str::from_utf8(config)?,
+            read_optional_file(&codex_home.join("auth.json"))?.as_deref(),
+        )
+    {
+        warnings.push(reason);
+    }
     Ok(ProviderState {
-        warnings: Vec::new(),
+        warnings,
         providers,
         active_provider_id,
         official_active,
@@ -131,7 +155,13 @@ pub(crate) fn save_provider_inner(
     let auth = build_custom_auth(&key)?;
     let direct_base_url =
         upstream::base_url_for_endpoint(&detection.inference_endpoint, &detection.protocol)?;
-    let config = build_provider_config(source_text, name, &direct_base_url, &key)?;
+    let config = config::build_provider_config_from_snapshot(
+        source_text,
+        source_text,
+        name,
+        &direct_base_url,
+        &key,
+    )?;
     let routing_mode = existing
         .as_ref()
         .filter(|profile| profile.record.protocol == detection.protocol)
@@ -280,40 +310,373 @@ pub(crate) fn set_keep_official_auth_with_progress(
     enabled: bool,
     progress: &ProgressReporter,
 ) -> Result<ProviderState, Box<dyn Error>> {
-    ensure_provider_migration(codex_home)?;
-    progress.stage(
-        1,
-        3,
-        "保存设置",
-        if enabled {
-            "正在开启：切换第三方时保留 ChatGPT 登录，请求走 API Key。"
-        } else {
-            "正在关闭：切换第三方时改为 API Key 直连。"
-        },
-    );
     let profiles = ProfileStore::new(codex_home);
-    let records = profiles.list_providers()?;
+    let mut settings = profiles.load_settings()?;
     let mut warnings = Vec::new();
-    if let Some(active_id) = detect_active_provider_id(codex_home, &profiles, &records)? {
-        warnings.extend(
-            activate_provider_with_mode(
-                codex_home,
-                &active_id,
-                codex_process::close_if_running,
-                progress,
-                Some(enabled),
-            )?
-            .warnings,
-        );
+    if !enabled {
+        if settings.official_route.is_some() {
+            warnings.extend(stop_official_route(codex_home, false)?.warnings);
+        } else {
+            settings.keep_official_auth = false;
+            let original = read_optional_file(&codex_home.join("config.toml"))?;
+            let text = std::str::from_utf8(original.as_deref().unwrap_or_default())?;
+            let legacy = custom_bearer_token(&parse_config(text)?).is_some();
+            let active =
+                detect_active_provider_id(codex_home, &profiles, &profiles.list_providers()?)?;
+            if legacy && let Some(id) = active {
+                let target = profiles.load_provider(&id)?;
+                let live = read_auth_for_transition(
+                    codex_home,
+                    Some(&target.auth),
+                    codex_process::close_if_running,
+                )?;
+                let original = read_optional_file(&codex_home.join("config.toml"))?;
+                let text = std::str::from_utf8(original.as_deref().unwrap_or_default())?;
+                if let Some(auth) = live
+                    && is_official_credential(&auth)
+                {
+                    let config = profiles
+                        .load_official_config()?
+                        .unwrap_or(build_official_config(text)?.into_bytes());
+                    profiles.save_official(&config, &auth)?;
+                }
+                let config = config::clear_request_bearer(text)?;
+                warnings.extend(
+                    provider_sync::apply_configuration_state(
+                        codex_home,
+                        original.as_deref(),
+                        config.as_bytes(),
+                        AuthUpdate::Replace(&target.auth),
+                        &serde_json::to_vec_pretty(&settings)?,
+                    )?
+                    .warnings,
+                );
+            } else {
+                profiles.save_settings(&settings)?;
+            }
+        }
     } else {
-        profiles.save_settings(&AppSettings {
-            keep_official_auth: enabled,
-        })?;
+        let records = profiles.list_providers()?;
+        let target = detect_active_provider_id(codex_home, &profiles, &records)?
+            .or_else(|| (records.len() == 1).then(|| records[0].id.clone()));
+        if let Some(id) = target {
+            warnings.extend(activate_official_route(codex_home, &id, progress)?.warnings);
+        } else {
+            warnings.extend(activate_official_route(codex_home, "openai", progress)?.warnings);
+        }
     }
-    progress.stage(3, 3, "完成", "鉴权方式已更新。");
-    let mut state = list_provider_state(codex_home)?;
+    let mut state = list_provider_state_read_only(codex_home)?;
     state.warnings.extend(warnings);
     Ok(state)
+}
+
+pub(crate) fn verify_route_config(
+    text: &str,
+    route: &profiles::OfficialRoute,
+) -> Result<(), Box<dyn Error>> {
+    if config::selected_provider(text)? != route.active_config_provider()
+        || config::provider_base_url(text, route.active_config_provider())?.as_deref()
+            != Some(route.local_base_url.as_str())
+    {
+        return Err("请求地址已被外部修改，已保留当前配置；请恢复原地址后再操作路由".into());
+    }
+    if route.http_transport.is_some()
+        && config::provider_websockets(text, route.active_config_provider())? != Some(false)
+    {
+        return Err(
+            "本地路由的 HTTP/SSE 设置已被外部修改，请恢复 supports_websockets = false 后再切换"
+                .into(),
+        );
+    }
+    if route
+        .http_transport
+        .as_ref()
+        .is_some_and(|transport| transport.previous_auth_fields.is_some())
+        && !config::uses_managed_file_auth(text, route.active_config_provider())?
+    {
+        return Err("路由认证字段已被外部修改，已保留当前配置；请恢复路由认证设置后再操作".into());
+    }
+    Ok(())
+}
+
+fn empty_route_report() -> ProviderSyncReport {
+    ProviderSyncReport {
+        rollout_files_updated: 0,
+        sqlite_rows_updated: 0,
+        providers_detected: Vec::new(),
+        backup_path: String::new(),
+        warnings: Vec::new(),
+    }
+}
+
+fn activate_official_route(
+    codex_home: &Path,
+    id: &str,
+    progress: &ProgressReporter,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    activate_official_route_with_close(codex_home, id, progress, codex_process::close_if_running)
+}
+
+fn activate_official_route_with_close<C>(
+    codex_home: &Path,
+    id: &str,
+    progress: &ProgressReporter,
+    close_codex: C,
+) -> Result<ProviderSyncReport, Box<dyn Error>>
+where
+    C: FnOnce() -> Result<bool, Box<dyn Error>>,
+{
+    let profiles = ProfileStore::new(codex_home);
+    if id != "openai" {
+        let target = profiles.load_provider(id)?;
+        api_key_from_auth(&target.auth)?.ok_or("供应商缺少 API Key")?;
+        if target.record.protocol != "openai_responses" && target.record.routing_mode != "local" {
+            return Err("请先启用该供应商的协议转换".into());
+        }
+        target
+            .record
+            .inference_endpoint
+            .as_ref()
+            .ok_or("供应商缺少已验证的推理接口，请重新保存供应商")?;
+    }
+    let mut settings = profiles.load_settings()?;
+    let original = read_optional_file(&codex_home.join("config.toml"))?;
+    let text = std::str::from_utf8(original.as_deref().unwrap_or_default())?;
+    let old_route = settings.official_route.clone();
+    if let Some(route) = &old_route {
+        verify_route_config(text, route)?;
+    }
+    let live_auth = read_optional_file(&codex_home.join("auth.json"))?;
+    // Once taken over, an external logout must remain visible. Never resurrect a stale saved RT.
+    if old_route.as_ref().is_some_and(|r| r.resident)
+        && !live_auth.as_deref().is_some_and(is_official_credential)
+    {
+        return Err("官方登录已退出，请点击官方登录完成认证后再使用路由".into());
+    }
+    let auth = if let Some(auth) = live_auth
+        .as_ref()
+        .filter(|auth| is_official_credential(auth))
+    {
+        auth.clone()
+    } else {
+        profiles
+            .load_official()?
+            .filter(|p| is_official_credential(&p.auth))
+            .map(|p| p.auth)
+            .ok_or("请先完成官方登录，再开启本地路由")?
+    };
+    let config_provider = old_route
+        .as_ref()
+        .map(|r| r.config_provider.clone())
+        .unwrap_or(config::selected_provider(text)?);
+    let needs_http_config = old_route.as_ref().is_none_or(|r| {
+        r.http_transport.as_ref().is_none_or(|transport| {
+            r.config_provider != "openai" && transport.previous_auth_fields.is_none()
+        })
+    });
+    if needs_http_config {
+        config::capture_route_transport(text, &config_provider)?;
+    }
+    let had_live_official = live_auth.as_deref().is_some_and(is_official_credential);
+    // Provider IDs must change once for the built-in openai provider: Codex ignores
+    // capability overrides on that built-in ID. Stop writers before migrating history.
+    let migrate_history = needs_http_config && config_provider == "openai";
+    if migrate_history || live_auth.as_deref() != Some(auth.as_slice()) {
+        close_codex()?;
+    }
+    let original = read_optional_file(&codex_home.join("config.toml"))?;
+    let text = std::str::from_utf8(original.as_deref().unwrap_or_default())?;
+    if let Some(route) = &old_route {
+        verify_route_config(text, route)?;
+    } else if config::selected_provider(text)? != config_provider {
+        return Err("准备路由期间提供方已被外部修改，请重新操作".into());
+    }
+    let http_transport = match &old_route {
+        Some(route) if route.http_transport.is_some() => {
+            let mut transport = route.http_transport.clone().unwrap();
+            if needs_http_config {
+                transport.previous_auth_fields =
+                    config::capture_route_transport(text, &config_provider)?.previous_auth_fields;
+            }
+            Some(transport)
+        }
+        _ => Some(config::capture_route_transport(text, &config_provider)?),
+    };
+    let previous_base_url = match &old_route {
+        Some(route) => route.previous_base_url.clone(),
+        None => config::provider_base_url(text, &config_provider)?,
+    };
+    let direct_provider_id = match &old_route {
+        Some(route) => route.direct_provider_id.clone().or_else(|| {
+            (!route.resident && route.config_provider != "openai")
+                .then(|| route.provider_id.clone())
+        }),
+        None => detect_active_provider_id(codex_home, &profiles, &profiles.list_providers()?)?,
+    };
+    let port = old_route
+        .as_ref()
+        .filter(|r| r.resident)
+        .map(|r| gateway::route_port(&r.local_base_url))
+        .transpose()?
+        .unwrap_or(0);
+    progress.stage(
+        1,
+        2,
+        "切换本地路由",
+        "正在准备常驻代理，后续请求使用选中的线路。",
+    );
+    let prepared = gateway::prepare_resident(codex_home, id, port)?;
+    let base_url = gateway::local_base_url(prepared.port());
+    let updated = if !needs_http_config {
+        text.to_string()
+    } else {
+        let direct_text = if old_route.is_some() && config_provider == "openai" {
+            config::with_provider_base_url(text, "openai", previous_base_url.as_deref())?
+        } else {
+            text.to_string()
+        };
+        config::with_http_route(&direct_text, &config_provider, &base_url)?
+    };
+    settings.keep_official_auth = true;
+    settings.official_route = Some(profiles::OfficialRoute {
+        provider_id: id.into(),
+        config_provider,
+        previous_base_url,
+        local_base_url: base_url,
+        resident: true,
+        direct_provider_id,
+        http_transport,
+    });
+    let live_auth = read_optional_file(&codex_home.join("auth.json"))?;
+    if had_live_official && !live_auth.as_deref().is_some_and(is_official_credential) {
+        return Err("准备路由期间官方登录已退出，请重新登录".into());
+    }
+    oauth::ensure_login_active()?;
+    let mut report = if !needs_http_config {
+        if !live_auth.as_deref().is_some_and(is_official_credential) {
+            return Err("切换期间官方登录已退出，已保留原线路，请重新登录".into());
+        }
+        // settings.json is the sole routing authority. An atomic rename is the commit point.
+        profiles.save_settings(&settings)?;
+        empty_route_report()
+    } else {
+        let auth_update = if live_auth.as_deref().is_some_and(is_official_credential) {
+            AuthUpdate::Keep
+        } else {
+            AuthUpdate::Replace(&auth)
+        };
+        let settings_bytes = serde_json::to_vec_pretty(&settings)?;
+        provider_sync::apply_route_state(
+            codex_home,
+            original.as_deref(),
+            updated.as_bytes(),
+            migrate_history.then_some(config::HTTP_ROUTE_PROVIDER_ID),
+            auth_update,
+            &settings_bytes,
+        )?
+    };
+    report.warnings.extend(prepared.commit());
+    if needs_http_config {
+        report.warnings.push(
+            "已启用 HTTP/SSE 本地路由，请重新打开 Codex；此后切换线路无需重启，CSwitch 需保持运行"
+                .into(),
+        );
+    }
+    progress.finish(2);
+    Ok(report)
+}
+
+fn stop_official_route(
+    codex_home: &Path,
+    keep_preference: bool,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    stop_official_route_with_close(codex_home, keep_preference, codex_process::close_if_running)
+}
+
+fn stop_official_route_with_close<C>(
+    codex_home: &Path,
+    keep_preference: bool,
+    close_codex: C,
+) -> Result<ProviderSyncReport, Box<dyn Error>>
+where
+    C: FnOnce() -> Result<bool, Box<dyn Error>>,
+{
+    let profiles = ProfileStore::new(codex_home);
+    let mut settings = profiles.load_settings()?;
+    let route = settings.official_route.take().ok_or("当前没有本地路由")?;
+    verify_route_config(&fs::read_to_string(codex_home.join("config.toml"))?, &route)?;
+    let direct_auth = if route.config_provider != "openai" && !keep_preference {
+        Some(
+            profiles
+                .load_provider(
+                    route
+                        .direct_provider_id
+                        .as_deref()
+                        .unwrap_or(&route.provider_id),
+                )?
+                .auth,
+        )
+    } else {
+        None
+    };
+    let migrate_history = route.http_transport.is_some() && route.config_provider == "openai";
+    if migrate_history || direct_auth.is_some() {
+        close_codex()?;
+    }
+    if let Some(target) = direct_auth.as_deref() {
+        let live = read_auth_for_transition(codex_home, Some(target), || Ok(false))?;
+        if let Some(auth) = live.filter(|auth| is_official_credential(auth)) {
+            let config = profiles.load_official_config()?.unwrap_or_default();
+            // Preserve the last rotation made by Codex during shutdown, before replacing it with an API key.
+            profiles.save_official(&config, &auth)?;
+        }
+    }
+    let original = read_optional_file(&codex_home.join("config.toml"))?;
+    let text = std::str::from_utf8(original.as_deref().unwrap_or_default())?;
+    verify_route_config(text, &route)?;
+    let updated = config::restore_route_config(text, &route)?;
+    settings.keep_official_auth = keep_preference;
+    let auth_update = direct_auth
+        .as_deref()
+        .map(AuthUpdate::Replace)
+        .unwrap_or(AuthUpdate::Keep);
+    let settings_bytes = serde_json::to_vec_pretty(&settings)?;
+    let mut report = provider_sync::apply_route_state(
+        codex_home,
+        original.as_deref(),
+        updated.as_bytes(),
+        migrate_history.then_some(route.config_provider.as_str()),
+        auth_update,
+        &settings_bytes,
+    )?;
+    if let Err(error) = gateway::stop(codex_home) {
+        report
+            .warnings
+            .push(format!("地址已恢复，清理本地代理失败：{error}"));
+    }
+    Ok(report)
+}
+
+// Changing only an address is lightweight. Changing auth must stop the cached auth owner first.
+// None means keep/restore official auth; Some means an exact target credential document.
+fn read_auth_for_transition<C>(
+    home: &Path,
+    target: Option<&[u8]>,
+    close: C,
+) -> Result<Option<Vec<u8>>, Box<dyn Error>>
+where
+    C: FnOnce() -> Result<bool, Box<dyn Error>>,
+{
+    let live = read_optional_file(&home.join("auth.json"))?;
+    let changes_auth = match target {
+        Some(target) => live.as_deref() != Some(target),
+        None => !live.as_deref().is_some_and(is_official_credential),
+    };
+    if changes_auth {
+        close()?;
+        return read_optional_file(&home.join("auth.json"));
+    }
+    Ok(live)
 }
 
 pub(crate) fn refresh_provider_models_inner(
@@ -377,19 +740,9 @@ pub(crate) fn activate_provider_inner_with_progress<C>(
 where
     C: FnOnce() -> Result<bool, Box<dyn Error>>,
 {
-    activate_provider_with_mode(codex_home, provider_id, close_codex, progress, None)
-}
-
-fn activate_provider_with_mode<C>(
-    codex_home: &Path,
-    provider_id: &str,
-    close_codex: C,
-    progress: &ProgressReporter,
-    mode_update: Option<bool>,
-) -> Result<ProviderSyncReport, Box<dyn Error>>
-where
-    C: FnOnce() -> Result<bool, Box<dyn Error>>,
-{
+    if ProfileStore::new(codex_home).keep_official_auth()? {
+        return activate_official_route_with_close(codex_home, provider_id, progress, close_codex);
+    }
     const TOTAL: u32 = 7;
     progress.stage(1, TOTAL, "准备切换", "正在读取供应商配置。");
     ensure_provider_migration(codex_home)?;
@@ -423,7 +776,13 @@ where
         } else {
             "direct"
         };
-        let config = build_provider_config(source, &target.record.name, &direct_base_url, &key)?;
+        let config = config::build_provider_config_from_snapshot(
+            source,
+            source,
+            &target.record.name,
+            &direct_base_url,
+            &key,
+        )?;
         let record = profiles.save_provider_with_routing(
             Some(provider_id),
             &target.record.name,
@@ -461,11 +820,6 @@ where
         let original_text = std::str::from_utf8(original_bytes)?;
         let active_id =
             detect_active_provider_id(codex_home, &profiles, &profiles.list_providers()?)?;
-        let keep_official_auth = mode_update.unwrap_or(profiles.keep_official_auth()?);
-        let saved_official_auth = profiles
-            .load_official()?
-            .map(|profile| profile.auth)
-            .filter(|auth| oauth::inspect_auth(auth) != LocalAuthState::Invalid);
         progress.stage(
             4,
             TOTAL,
@@ -473,12 +827,7 @@ where
             "正在保存当前供应商或官方登录的快照。",
         );
         if let Some(active_id) = active_id.as_deref().filter(|id| *id != provider_id) {
-            snapshot_provider_without_clobbering_key(
-                &profiles,
-                active_id,
-                original_bytes,
-                read_optional_file(&codex_home.join("auth.json"))?.as_deref(),
-            )?;
+            snapshot_provider_without_clobbering_key(&profiles, active_id, original_bytes)?;
         }
         if is_official_config(original_text)? {
             capture_official_profile(codex_home, &profiles, original_bytes)?;
@@ -507,16 +856,18 @@ where
                 &target.record.protocol,
             )?
         };
-        let updated = build_provider_config(
+        let updated = config::build_provider_config_from_snapshot(
             original_text,
+            std::str::from_utf8(&target.config)?,
             &target.record.name,
             &active_base_url,
             &provider_key,
         )?;
-        let updated = config::set_request_bearer(
-            &updated,
-            keep_official_auth.then_some(provider_key.as_str()),
-        )?;
+        let updated = if using_gateway {
+            config::with_provider_websockets(&updated, PROVIDER_ID, Some(false))?
+        } else {
+            updated
+        };
         verify_provider_content(
             updated.as_bytes(),
             &target.auth,
@@ -524,20 +875,14 @@ where
             &active_base_url,
         )?;
         profiles.update_provider_snapshot(provider_id, updated.as_bytes(), &target.auth)?;
-        let live_auth = read_optional_file(&codex_home.join("auth.json"))?;
-        let auth_update = resolve_live_auth_update(
-            keep_official_auth,
-            live_auth.as_deref(),
-            saved_official_auth.as_deref(),
-            &target.auth,
-        );
+        let auth_update = AuthUpdate::Replace(&target.auth);
         report_history_stage(progress, 6, TOTAL);
-        let settings = mode_update
-            .map(|enabled| {
-                serde_json::to_vec_pretty(&AppSettings {
-                    keep_official_auth: enabled,
-                })
-            })
+        let mut settings = profiles.load_settings()?;
+        let update_settings = settings.official_route.is_some();
+        settings.keep_official_auth = false;
+        settings.official_route = None;
+        let settings = update_settings
+            .then(|| serde_json::to_vec_pretty(&settings))
             .transpose()?;
         let mut report = provider_sync::apply_provider_state_with_settings(
             codex_home,
@@ -570,6 +915,14 @@ pub(crate) fn delete_provider_inner(
     if active_id.as_deref() == Some(provider_id) {
         return Err("当前供应商正在使用，请先切换到官方登录或其他供应商".into());
     }
+    if profiles
+        .load_settings()?
+        .official_route
+        .as_ref()
+        .is_some_and(|route| route.direct_provider_id.as_deref() == Some(provider_id))
+    {
+        return Err("关闭路由时需要恢复此供应商，请先关闭常驻路由再删除".into());
+    }
     gateway::stop_provider(codex_home, provider_id)?;
     profiles.delete_provider(provider_id)
 }
@@ -577,43 +930,67 @@ pub(crate) fn delete_provider_inner(
 pub(crate) fn ensure_provider_migration(codex_home: &Path) -> Result<(), Box<dyn Error>> {
     profiles::migrate_legacy_profile_storage(codex_home)?;
     let profiles = ProfileStore::new(codex_home);
-    if profiles.provider_registry_exists() {
-        return Ok(());
-    }
+    let first_import = !profiles.provider_registry_exists();
     let active_config = read_optional_file(&codex_home.join("config.toml"))?;
     let active_auth = read_optional_file(&codex_home.join("auth.json"))?;
-    let legacy = profiles
-        .load_custom_config()?
-        .zip(profiles.load_custom_auth()?);
-    let active_pair = match (active_config.as_ref(), active_auth.as_ref()) {
-        (Some(config), Some(auth))
-            if config_selects_custom(config)? && api_key_from_auth(auth)?.is_some() =>
-        {
-            Some((config.clone(), auth.clone()))
-        }
-        _ => None,
-    };
-    let pair = active_pair.or(legacy);
-    if let Some((config, auth)) = pair {
-        let text = std::str::from_utf8(&config)?;
-        let document = parse_config(text)?;
-        if let Some(provider) = custom_provider(&document)
-            && let (Some(name), Some(api_url), Some(_key)) = (
-                provider.get("name").and_then(Item::as_str),
-                provider.get("base_url").and_then(Item::as_str),
-                api_key_from_auth(&auth)?,
-            )
-        {
-            let name = if name.trim().is_empty() {
-                "第三方 API"
-            } else {
-                name
-            };
-            let url = normalize_api_url(api_url)?;
-            profiles.save_provider_without_catalog(name, &url, &auth, &config)?;
-        }
+    // Route settings own the upstream identity. Never import our loopback endpoint.
+    if profiles.load_settings()?.official_route.is_none()
+        && let Some(config) = active_config.as_deref()
+    {
+        import_provider_snapshot(&profiles, codex_home, config, active_auth.as_deref())?;
+    }
+    if first_import
+        && let Some((config, auth)) = profiles
+            .load_custom_config()?
+            .zip(profiles.load_custom_auth()?)
+    {
+        import_provider_snapshot(&profiles, codex_home, &config, Some(&auth))?;
     }
     profiles.ensure_provider_registry()
+}
+
+fn import_provider_snapshot(
+    profiles: &ProfileStore,
+    codex_home: &Path,
+    config: &[u8],
+    auth: Option<&[u8]>,
+) -> Result<(), Box<dyn Error>> {
+    let provider_import::Inspection::Ready(candidate) =
+        provider_import::inspect(std::str::from_utf8(config)?, auth)
+    else {
+        // NeedsInput is returned to the UI as a warning by list_provider_state_read_only.
+        // A missing external credential must not make the API configuration form inaccessible.
+        return Ok(());
+    };
+    let records = profiles.list_providers()?;
+    if find_matching_provider(codex_home, profiles, &records, &candidate)?.is_some() {
+        return Ok(());
+    }
+    let mut name = candidate.name.clone();
+    let mut suffix = 1;
+    while records
+        .iter()
+        .any(|record| record.name.eq_ignore_ascii_case(&name))
+    {
+        let short_id: String = candidate.provider_id.chars().take(32).collect();
+        let ending = if suffix == 1 {
+            format!(" ({short_id})")
+        } else {
+            format!(" ({short_id}-{suffix})")
+        };
+        let prefix: String = candidate
+            .name
+            .chars()
+            .take(80 - ending.chars().count())
+            .collect();
+        name = format!("{prefix}{ending}");
+        suffix += 1;
+    }
+    // Keep the original configuration as the import snapshot. Only the profile's
+    // credential is normalized; the live auth/config and history are untouched.
+    let auth = build_custom_auth(&candidate.api_key)?;
+    profiles.save_provider_without_catalog(&name, &candidate.api_url, &auth, config)?;
+    Ok(())
 }
 
 fn detect_active_provider_id(
@@ -625,32 +1002,36 @@ fn detect_active_provider_id(
     let Some(config) = config else {
         return Ok(None);
     };
-    if !config_selects_custom(&config)? {
-        return Ok(None);
+    if let Some(route) = profiles.load_settings()?.official_route {
+        let text = std::str::from_utf8(&config)?;
+        if verify_route_config(text, &route).is_ok()
+            && records.iter().any(|record| record.id == route.provider_id)
+        {
+            return Ok(Some(route.provider_id));
+        }
     }
-    let document = parse_config(std::str::from_utf8(&config)?)?;
-    let Some(provider) = custom_provider(&document) else {
+    let provider_import::Inspection::Ready(candidate) = provider_import::inspect(
+        std::str::from_utf8(&config)?,
+        read_optional_file(&codex_home.join("auth.json"))?.as_deref(),
+    ) else {
         return Ok(None);
     };
-    let name = provider
-        .get("name")
-        .and_then(Item::as_str)
-        .unwrap_or_default();
-    let api_url = provider
-        .get("base_url")
-        .and_then(Item::as_str)
-        .map(normalize_api_url)
-        .transpose()?;
-    let Some(api_url) = api_url else {
-        return Ok(None);
-    };
-    let live_key = read_optional_file(&codex_home.join("auth.json"))?
-        .as_deref()
-        .map(api_key_from_auth)
-        .transpose()?
-        .flatten();
-    let live_bearer = custom_bearer_token(&document).map(str::to_string);
-    for record in records {
+    find_matching_provider(codex_home, profiles, records, &candidate)
+}
+
+fn find_matching_provider(
+    codex_home: &Path,
+    profiles: &ProfileStore,
+    records: &[ProviderRecord],
+    candidate: &provider_import::ImportCandidate,
+) -> Result<Option<String>, Box<dyn Error>> {
+    // Prefer the display name, but an imported name may have been disambiguated
+    // or renamed. URL and credential must both match in every case.
+    for record in records
+        .iter()
+        .filter(|r| r.name == candidate.name)
+        .chain(records.iter().filter(|r| r.name != candidate.name))
+    {
         let expected_url = if record.routing_mode == "local" {
             gateway::active_base_url(codex_home, &record.id)
         } else {
@@ -662,12 +1043,12 @@ fn detect_active_provider_id(
                 })
                 .or_else(|| Some(record.api_url.clone()))
         };
-        if record.name != name || expected_url.as_deref() != Some(api_url.as_str()) {
+        if expected_url.as_deref() != Some(candidate.api_url.as_str()) {
             continue;
         }
         let profile = profiles.load_provider(&record.id)?;
         let profile_key = api_key_from_auth(&profile.auth)?;
-        if profile_key.as_ref() == live_bearer.as_ref() || profile_key == live_key {
+        if profile_key.as_deref() == Some(candidate.api_key.as_str()) {
             return Ok(Some(record.id.clone()));
         }
     }
@@ -678,6 +1059,17 @@ pub(crate) fn switch_to_official_with_progress(
     codex_home: &Path,
     progress: &ProgressReporter,
 ) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    if ProfileStore::new(codex_home)
+        .load_settings()?
+        .official_route
+        .is_some()
+        && read_optional_file(&codex_home.join("auth.json"))?
+            .as_deref()
+            .is_some_and(is_official_credential)
+    {
+        oauth::ensure_login_active()?;
+        return activate_official_route(codex_home, "openai", progress);
+    }
     const TOTAL: u32 = 7;
     progress.stage(1, TOTAL, "准备切换", "正在检查官方登录状态。");
     oauth::ensure_login_active()?;
@@ -692,13 +1084,21 @@ pub(crate) fn switch_to_official_with_progress(
     let profiles = ProfileStore::new(codex_home);
     let mut candidates = Vec::new();
     // Credential selection is independent of the active provider: custom mode may retain fresh OAuth tokens.
-    if let Some(auth) = read_optional_file(&codex_home.join("auth.json"))? {
+    let live_auth = read_optional_file(&codex_home.join("auth.json"))?;
+    if let Some(auth) = live_auth.clone() {
         push_unique_auth(&mut candidates, auth);
     }
-    if let Some(saved) = profiles.load_official()? {
+    // A live official login is authoritative, even if revoked. Never silently switch to a saved account.
+    if !live_auth.as_deref().is_some_and(is_official_credential)
+        && profiles.load_settings()?.official_route.is_none()
+        && let Some(saved) = profiles.load_official()?
+    {
         push_unique_auth(&mut candidates, saved.auth);
     }
     let selected = select_official_auth(&candidates)?;
+    let refreshed_live = selected.as_ref().is_some_and(|auth| {
+        live_auth.as_deref().is_some_and(is_official_credential) && live_auth.as_ref() != Some(auth)
+    });
     let mut official_auth = match selected {
         Some(auth) => auth,
         None => {
@@ -711,10 +1111,17 @@ pub(crate) fn switch_to_official_with_progress(
             oauth::browser_login()?
         }
     };
-    oauth::ensure_login_active()?;
     // Save rotated credentials before any unrelated close/write failure can lose them.
     let saved_config = profiles.load_official_config()?.unwrap_or_default();
     profiles.save_official(&saved_config, &official_auth)?;
+    if refreshed_live {
+        if read_optional_file(&codex_home.join("auth.json"))? != live_auth {
+            return Err("认证检查期间 auth.json 已被其他程序修改，已保留最新凭据".into());
+        }
+        profiles::atomic_write_private(&codex_home.join("auth.json"), &official_auth)?;
+        push_unique_auth(&mut candidates, official_auth.clone());
+    }
+    oauth::ensure_login_active()?;
     progress.stage(4, TOTAL, "关闭 Codex", "正在等待 Codex 完成退出。");
     codex_process::close_if_running()?;
     oauth::ensure_login_active()?;
@@ -729,20 +1136,23 @@ pub(crate) fn switch_to_official_with_progress(
     let original = read_optional_file(&codex_home.join("config.toml"))?;
     let original_bytes = original.as_deref().unwrap_or_default();
     let original_text = std::str::from_utf8(original_bytes)?;
-    let active_is_official = is_official_config(original_text)?;
+    let active_is_official = is_official_config(original_text)?
+        || profiles
+            .load_settings()?
+            .official_route
+            .as_ref()
+            .is_some_and(|route| {
+                route.config_provider == "openai"
+                    && verify_route_config(original_text, route).is_ok()
+            });
     if !active_is_official {
         let records = profiles.list_providers()?;
         if let Some(id) = detect_active_provider_id(codex_home, &profiles, &records)? {
-            snapshot_provider_without_clobbering_key(
-                &profiles,
-                &id,
-                original_bytes,
-                read_optional_file(&codex_home.join("auth.json"))?.as_deref(),
-            )?;
+            snapshot_provider_without_clobbering_key(&profiles, &id, original_bytes)?;
         }
     }
     let official_config = if active_is_official {
-        original_bytes.to_vec()
+        official_snapshot_config(original_text, &profiles)?.into_bytes()
     } else if !saved_config.is_empty() {
         saved_config
     } else {
@@ -766,6 +1176,10 @@ pub(crate) fn switch_to_official_with_progress(
             .warnings
             .push(format!("官方切换已完成，旧路由清理失败：{error}"));
     }
+    if profiles.keep_official_auth()? {
+        let route_report = activate_official_route(codex_home, "openai", progress)?;
+        report.warnings.extend(route_report.warnings);
+    }
     progress.stage(7, TOTAL, "完成", "已切换到官方登录。");
     Ok(report)
 }
@@ -777,46 +1191,26 @@ fn push_unique_auth(candidates: &mut Vec<Vec<u8>>, candidate: Vec<u8>) {
 }
 
 fn select_official_auth(candidates: &[Vec<u8>]) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-    let mut errors = Vec::new();
+    select_official_auth_with(candidates, oauth::validate_auth, oauth::refresh_auth)
+}
+
+fn select_official_auth_with<V, R>(
+    candidates: &[Vec<u8>],
+    mut validate: V,
+    mut refresh: R,
+) -> Result<Option<Vec<u8>>, Box<dyn Error>>
+where
+    V: FnMut(&[u8]) -> Result<AuthHealth, Box<dyn Error>>,
+    R: FnMut(&[u8]) -> Result<AuthHealth, Box<dyn Error>>,
+{
     for candidate in candidates {
         let health = match oauth::inspect_auth(candidate) {
             LocalAuthState::Invalid => continue,
-            LocalAuthState::Current => oauth::validate_auth(candidate),
-            LocalAuthState::NeedsRefresh => oauth::refresh_auth(candidate),
+            LocalAuthState::Current => validate(candidate)?,
+            LocalAuthState::NeedsRefresh => refresh(candidate)?,
         };
         match health {
-            Ok(AuthHealth::Valid(auth)) => return Ok(Some(auth)),
-            Ok(AuthHealth::Invalid) => {}
-            Err(error) => errors.push(error.to_string()),
-        }
-    }
-    if !errors.is_empty() {
-        return Err(format!("认证检查未完成，凭据已保留：{}", errors.join("；")).into());
-    }
-    Ok(None)
-}
-
-#[cfg(test)]
-fn select_official_auth_with<F>(
-    candidates: &[Vec<u8>],
-    mut refresh: F,
-) -> Result<Option<Vec<u8>>, Box<dyn Error>>
-where
-    F: FnMut(&[u8]) -> Result<AuthHealth, Box<dyn Error>>,
-{
-    if let Some(current) = candidates
-        .iter()
-        .find(|candidate| oauth::inspect_auth(candidate) == LocalAuthState::Current)
-    {
-        return Ok(Some(current.clone()));
-    }
-
-    for candidate in candidates {
-        if oauth::inspect_auth(candidate) != LocalAuthState::NeedsRefresh {
-            continue;
-        }
-        match refresh(candidate)? {
-            AuthHealth::Valid(refreshed) => return Ok(Some(refreshed)),
+            AuthHealth::Valid(auth) => return Ok(Some(auth)),
             AuthHealth::Invalid => {}
         }
     }
@@ -828,6 +1222,8 @@ fn capture_official_profile(
     profiles: &ProfileStore,
     config: &[u8],
 ) -> Result<(), Box<dyn Error>> {
+    let config = official_snapshot_config(std::str::from_utf8(config)?, profiles)?;
+    let config = config.as_bytes();
     profiles.save_official_config(config)?;
     let Some(candidate) = read_optional_file(&codex_home.join("auth.json"))? else {
         profiles.discard_official_auth()?;
@@ -840,6 +1236,16 @@ fn capture_official_profile(
     profiles.save_official(config, &candidate)
 }
 
+fn official_snapshot_config(text: &str, profiles: &ProfileStore) -> Result<String, Box<dyn Error>> {
+    if let Some(route) = profiles.load_settings()?.official_route
+        && route.config_provider == "openai"
+        && verify_route_config(text, &route).is_ok()
+    {
+        return config::restore_route_config(text, &route);
+    }
+    Ok(text.to_string())
+}
+
 fn report_history_stage(progress: &ProgressReporter, current: u32, total: u32) {
     progress.stage(
         current,
@@ -849,36 +1255,15 @@ fn report_history_stage(progress: &ProgressReporter, current: u32, total: u32) {
     );
 }
 
-fn resolve_live_auth_update<'a>(
-    keep_official_auth: bool,
-    live_auth: Option<&'a [u8]>,
-    saved_official_auth: Option<&'a [u8]>,
-    provider_auth: &'a [u8],
-) -> AuthUpdate<'a> {
-    if !keep_official_auth {
-        return AuthUpdate::Replace(provider_auth);
-    }
-    if live_auth.is_some_and(is_official_credential) {
-        return AuthUpdate::Keep;
-    }
-    if let Some(official) = saved_official_auth.filter(|auth| is_official_credential(auth)) {
-        return AuthUpdate::Replace(official);
-    }
-    AuthUpdate::Replace(provider_auth)
-}
-
 fn snapshot_provider_without_clobbering_key(
     profiles: &ProfileStore,
     provider_id: &str,
     config: &[u8],
-    live_auth: Option<&[u8]>,
 ) -> Result<(), Box<dyn Error>> {
     let stored = profiles.load_provider(provider_id)?;
-    let auth = match live_auth {
-        Some(auth) if api_key_from_auth(auth)?.is_some() => auth.to_vec(),
-        _ => stored.auth,
-    };
-    profiles.update_provider_snapshot(provider_id, config, &auth)
+    // The active provider resolver already matched this exact credential. A live
+    // auth.json can belong to another account when fixed provider auth wins.
+    profiles.update_provider_snapshot(provider_id, config, &stored.auth)
 }
 
 fn is_official_credential(auth: &[u8]) -> bool {
@@ -906,12 +1291,19 @@ fn activate_official(
     official_config: &[u8],
     official_auth: &[u8],
 ) -> Result<ProviderSyncReport, Box<dyn Error>> {
-    let report = provider_sync::apply_provider_state(
+    let profiles = ProfileStore::new(codex_home);
+    let mut settings = profiles.load_settings()?;
+    let settings_update = if settings.official_route.take().is_some() {
+        Some(serde_json::to_vec_pretty(&settings)?)
+    } else {
+        None
+    };
+    let report = provider_sync::apply_official_state(
         codex_home,
         original_config,
         official_config,
-        OFFICIAL_PROVIDER_ID,
-        AuthUpdate::Replace(official_auth),
+        official_auth,
+        settings_update.as_deref(),
     )?;
     if fs::read(codex_home.join("config.toml"))? != official_config {
         return Err("官方 config.toml 恢复后的字节验证失败".into());

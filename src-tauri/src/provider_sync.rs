@@ -143,6 +143,7 @@ fn apply_provider_config(
     )
 }
 
+#[cfg(test)]
 pub fn apply_provider_state(
     codex_home: &Path,
     original_config: Option<&[u8]>,
@@ -204,6 +205,7 @@ fn migrate_legacy_sync_storage(codex_home: &Path) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_provider_config_with_hook<F>(
     codex_home: &Path,
     original_config: Option<&[u8]>,
@@ -222,6 +224,7 @@ where
         target_provider,
         auth_update,
         None,
+        true,
         before_config_write,
     )
 }
@@ -241,10 +244,86 @@ pub fn apply_provider_state_with_settings(
         target_provider,
         auth_update,
         settings,
+        true,
         || Ok(()),
     )
 }
 
+pub fn apply_official_state(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    updated_config: &[u8],
+    auth: &[u8],
+    settings: Option<&[u8]>,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    let cancelled = crate::oauth::current_login_cancellation()?;
+    apply_provider_config_with_settings_and_hook(
+        codex_home,
+        original_config,
+        updated_config,
+        "openai",
+        AuthUpdate::Replace(auth),
+        settings,
+        true,
+        move || {
+            if cancelled
+                .as_ref()
+                .is_some_and(|token| token.load(Ordering::SeqCst))
+            {
+                return Err("官方登录已取消".into());
+            }
+            Ok(())
+        },
+    )
+}
+
+pub fn apply_configuration_state(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    updated_config: &[u8],
+    auth_update: AuthUpdate<'_>,
+    settings: &[u8],
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    apply_route_state(
+        codex_home,
+        original_config,
+        updated_config,
+        None,
+        auth_update,
+        settings,
+    )
+}
+
+pub fn apply_route_state(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    updated_config: &[u8],
+    history_provider: Option<&str>,
+    auth_update: AuthUpdate<'_>,
+    settings: &[u8],
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    let cancelled = crate::oauth::current_login_cancellation()?;
+    apply_provider_config_with_settings_and_hook(
+        codex_home,
+        original_config,
+        updated_config,
+        history_provider.unwrap_or("unchanged"),
+        auth_update,
+        Some(settings),
+        history_provider.is_some(),
+        move || {
+            if cancelled
+                .as_ref()
+                .is_some_and(|token| token.load(Ordering::SeqCst))
+            {
+                return Err("官方登录已取消".into());
+            }
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_provider_config_with_settings_and_hook<F>(
     codex_home: &Path,
     original_config: Option<&[u8]>,
@@ -252,6 +331,7 @@ fn apply_provider_config_with_settings_and_hook<F>(
     target_provider: &str,
     auth_update: AuthUpdate<'_>,
     settings: Option<&[u8]>,
+    sync_history: bool,
     before_config_write: F,
 ) -> Result<ProviderSyncReport, Box<dyn Error>>
 where
@@ -296,13 +376,25 @@ where
         AuthUpdate::Keep => true,
         AuthUpdate::Replace(auth) => original_auth.as_deref() == Some(auth),
     };
-    let changes = collect_rollout_changes(codex_home, target_provider)?;
-    let state_db = resolve_state_db(codex_home)?;
+    let changes = if sync_history {
+        collect_rollout_changes(codex_home, target_provider)?
+    } else {
+        Vec::new()
+    };
+    let state_db = if sync_history {
+        resolve_state_db(codex_home)?
+    } else {
+        None
+    };
     // Both layouts can coexist across desktop/CLI versions. Synchronize both; never guess the active file.
-    let extra_databases = state_databases(codex_home)?
-        .into_iter()
-        .filter(|path| Some(path) != state_db.as_ref())
-        .collect::<Vec<_>>();
+    let extra_databases = if sync_history {
+        state_databases(codex_home)?
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .filter(|path| Some(path) != state_db.as_ref())
+    .collect::<Vec<_>>();
     let mut sqlite_counts = match state_db.as_deref() {
         Some(path) => match read_sqlite_provider_counts(path) {
             Ok(counts) => counts,
@@ -2316,6 +2408,7 @@ mod multi_database_regression_tests {
                     } else {
                         b"new-settings"
                     }),
+                    true,
                     || {
                         fs::write(root.join(edited), b"# concurrent-user-edit")?;
                         Ok(())
@@ -2410,5 +2503,36 @@ mod multi_database_regression_tests {
             assert_eq!(provider, format!("provider-{i}"));
         }
         assert!(!root.join("config.toml").exists());
+    }
+}
+
+#[cfg(test)]
+mod official_cancel_tests {
+    use super::*;
+    #[test]
+    #[ignore = "shares the official login attempt; run serial process checks"]
+    fn cancelled_official_switch_restores_history_and_preserves_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let before = b"model_provider='custom'\n";
+        fs::write(root.join("config.toml"), before).unwrap();
+        fs::write(root.join("auth.json"), b"original-auth").unwrap();
+        Connection::open(root.join(STATE_DB_NAME)).unwrap().execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY,model_provider TEXT); INSERT INTO threads VALUES('fixture','custom');").unwrap();
+        let _attempt = crate::oauth::begin_login().unwrap();
+        crate::oauth::cancel_login();
+        let error =
+            apply_official_state(root, Some(before), b"model='official'\n", b"new-auth", None)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("官方登录已取消"));
+        assert_eq!(fs::read(root.join("config.toml")).unwrap(), before);
+        assert_eq!(fs::read(root.join("auth.json")).unwrap(), b"original-auth");
+        let value: String = Connection::open(root.join(STATE_DB_NAME))
+            .unwrap()
+            .query_row("SELECT model_provider FROM threads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "custom");
+        assert!(!root.join(TRANSACTION_FILE).exists());
     }
 }

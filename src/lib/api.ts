@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import type {
   OperationProgress,
   ProviderDraft,
@@ -9,6 +10,7 @@ import type {
 } from "../types";
 
 export const cswitchApi = {
+  resizeWindow: (height: number) => getCurrentWindow().setSize(new LogicalSize(window.innerWidth, height)),
   listProviders: () => invoke<ProviderState>("list_providers"),
   saveProvider: (providerId: string | null, draft: ProviderDraft) =>
     invoke<SavedProvider>("save_provider", {

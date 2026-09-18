@@ -84,7 +84,13 @@ pub(crate) fn handle_tray_menu(app: &AppHandle, id: &str) {
 }
 
 #[tauri::command]
-fn list_providers() -> Result<ProviderState, String> {
+async fn list_providers() -> Result<ProviderState, String> {
+    tauri::async_runtime::spawn_blocking(list_providers_inner)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn list_providers_inner() -> Result<ProviderState, String> {
     let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
     let _guard = acquire_app_operation()
         .map_err(|error| operation_error(&codex_home, "获取应用操作锁", error))?;
@@ -92,8 +98,14 @@ fn list_providers() -> Result<ProviderState, String> {
         .map_err(|error| operation_error(&codex_home, "获取跨进程操作锁", error))?;
     provider_sync::recover_pending_state(&codex_home)
         .map_err(|error| operation_error(&codex_home, "恢复上次未完成的操作", error))?;
-    list_provider_state(&codex_home)
-        .map_err(|error| operation_error(&codex_home, "读取供应商列表", error))
+    let mut state = list_provider_state(&codex_home)
+        .map_err(|error| operation_error(&codex_home, "读取供应商列表", error))?;
+    if let Err(error) = crate::gateway::restore_resident(&codex_home) {
+        state
+            .warnings
+            .push(operation_error(&codex_home, "恢复常驻路由", error));
+    }
+    Ok(state)
 }
 
 #[tauri::command]
@@ -212,7 +224,7 @@ async fn set_keep_official_auth(app: AppHandle, enabled: bool) -> Result<Provide
     .await
     .map_err(|error| operation_error(&codex_home, "等待官方登录保留设置任务", error))?;
     match &result {
-        Ok(_) => notify_providers_changed(&app),
+        Ok(_) => tray::refresh(&app),
         Err(_) if started.load(Ordering::SeqCst) => fail_operation(&app, "keep-auth"),
         Err(_) => {}
     }

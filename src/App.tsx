@@ -1,10 +1,10 @@
 import {
   Check,
   CircleUserRound,
+  Info,
   LoaderCircle,
   LogIn,
   Plus,
-  ShieldCheck,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -54,6 +54,14 @@ function App() {
   const [deletingProvider, setDeletingProvider] = useState<ProviderSummary | null>(null);
   const [progress, setProgress] = useState<OperationProgress | null>(null);
   const noticeTimer = useRef<number | null>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
+  const officialCancelled = useRef(false);
+  const inFlight = useRef(false);
+  const beginAction = () => {
+    if (inFlight.current || busy || progress) return false;
+    inFlight.current = true;
+    return true;
+  };
 
   const showNotice = useCallback((kind: "success" | "error", text: string) => {
     if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
@@ -99,13 +107,21 @@ function App() {
     let unlistenChanged: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
     void cswitchApi.onProgress((next) => {
+      if (next.operation === "keep-auth") return;
+      if (next.operation === "official" && officialCancelled.current) {
+        if (next.done && !inFlight.current) setBusy(null);
+        return;
+      }
       setProgress(next.done ? null : next);
-      if (next.done) setBusy(null);
-      else if (next.operation) setBusy(next.operation);
+      if (!inFlight.current) {
+        if (next.done) setBusy(null);
+        else if (next.operation) setBusy(next.operation);
+      }
     }).then((fn) => {
       if (disposed) fn(); else unlistenProgress = fn;
     });
     void cswitchApi.onProvidersChanged(() => {
+      if (inFlight.current) return;
       void refresh().catch((error) => showNotice("error", errorText(error)));
     }).then((fn) => {
       if (disposed) fn(); else unlistenChanged = fn;
@@ -138,6 +154,7 @@ function App() {
       setRoutingProvider(provider);
       return;
     }
+    if (!beginAction()) return;
     setBusy(provider.id);
     setProgress({
       operation: "activate",
@@ -155,12 +172,14 @@ function App() {
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      inFlight.current = false;
       setProgress(null);
       setBusy(null);
     }
   };
 
   const save = async (draft: ProviderDraft) => {
+    if (!beginAction()) return;
     const wasActive = Boolean(editingProvider?.active);
     setBusy("save");
     setProgress({
@@ -192,13 +211,14 @@ function App() {
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      inFlight.current = false;
       setProgress(null);
       setBusy(null);
     }
   };
 
   const enableRouting = async () => {
-    if (!routingProvider) return;
+    if (!routingProvider || !beginAction()) return;
     const provider = routingProvider;
     setBusy("route");
     setProgress({
@@ -219,13 +239,14 @@ function App() {
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      inFlight.current = false;
       setProgress(null);
       setBusy(null);
     }
   };
 
   const refreshModels = async (provider: ProviderSummary) => {
-    if (busy || progress) return;
+    if (!beginAction()) return;
     setBusy("models");
     try {
       setState(await cswitchApi.refreshProviderModels(provider.id));
@@ -233,12 +254,13 @@ function App() {
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      inFlight.current = false;
       setBusy(null);
     }
   };
 
   const removeProvider = async () => {
-    if (!deletingProvider) return;
+    if (!deletingProvider || !beginAction()) return;
     setBusy("delete");
     try {
       await cswitchApi.deleteProvider(deletingProvider.id);
@@ -248,12 +270,14 @@ function App() {
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      inFlight.current = false;
       setBusy(null);
     }
   };
 
   const useOfficial = async () => {
-    if (busy || progress) return;
+    if (!beginAction()) return;
+    officialCancelled.current = false;
     setBusy("official");
     setProgress({
       operation: "official",
@@ -267,49 +291,46 @@ function App() {
     try {
       const report = await cswitchApi.startOfficialLogin();
       await refresh();
-      reportSuccess("官方登录", report);
+      if (officialCancelled.current) showNotice("success", "切换已经完成，取消请求到达时操作已提交");
+      else reportSuccess("官方登录", report);
     } catch (error) {
       const message = errorText(error);
-      if (message !== "官方登录已取消") showNotice("error", message);
+      if (!officialCancelled.current && message !== "官方登录已取消") showNotice("error", message);
     } finally {
+      inFlight.current = false;
       setProgress(null);
       setBusy(null);
     }
   };
 
   const toggleKeepOfficialAuth = async () => {
-    if (busy || progress) return;
+    if (!beginAction()) return;
     const enabled = !state.keepOfficialAuth;
     setBusy("keep-auth");
-    setProgress({
-      operation: "keep-auth",
-      title: enabled ? "开启保留官方登录" : "关闭保留官方登录",
-      stage: "准备更新",
-      detail: "正在保存鉴权方式并重新应用当前供应商。",
-      current: 0,
-      total: 3,
-      done: false,
-    });
     try {
       setState(await cswitchApi.setKeepOfficialAuth(enabled));
       showNotice(
         "success",
         enabled
-          ? "已开启：切换第三方时保留官方登录，请求走 API Key"
-          : "已关闭：切换第三方时 API Key 直连",
+          ? "常驻路由已开启；首次启用请重新打开 Codex，后续切换线路直接生效"
+          : "已关闭本地路由，请重新打开 Codex 使用原请求地址",
       );
     } catch (error) {
       showNotice("error", errorText(error));
     } finally {
+      inFlight.current = false;
       setProgress(null);
       setBusy(null);
     }
   };
 
   const cancelOfficial = async () => {
+    officialCancelled.current = true;
+    setProgress(null);
+    setBusy("official-cancelling");
     try {
       await cswitchApi.cancelOfficialLogin();
-      showNotice("success", "正在取消官方登录");
+      showNotice("success", "已取消，正在结束当前操作");
     } catch (error) {
       showNotice("error", errorText(error));
     }
@@ -317,12 +338,34 @@ function App() {
 
   const isLoading = busy === "load";
   const locked = Boolean(busy) || Boolean(progress);
+  const hasDialog = providerDialogOpen || Boolean(routingProvider) || Boolean(deletingProvider) || Boolean(progress);
+
+  useEffect(() => {
+    if (isLoading) return;
+    const frame = window.requestAnimationFrame(() => {
+      const shell = shellRef.current;
+      if (!shell) return;
+      const header = shell.querySelector<HTMLElement>(".topbar");
+      const main = shell.querySelector<HTMLElement>("main");
+      let height = (header?.offsetHeight ?? 0) + (main?.offsetHeight ?? 0);
+      for (const panel of shell.querySelectorAll<HTMLElement>(".dialog-panel, .progress-card")) {
+        height = Math.max(height, panel.scrollHeight + 42);
+      }
+      const limit = Math.max(220, Math.min(600, window.screen.availHeight - 80));
+      height = Math.max(220, Math.min(limit, Math.ceil(height)));
+      if (Math.abs(window.innerHeight - height) > 1) {
+        void cswitchApi.resizeWindow(height).catch((error) => showNotice("error", errorText(error)));
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isLoading, state.providers.length, hasDialog, showNotice]);
+
   const percent = progress && progress.total > 0
     ? Math.min(100, Math.round((progress.current / progress.total) * 100))
     : 0;
 
   return (
-    <div className="app-shell">
+    <div ref={shellRef} className={`app-shell${state.keepOfficialAuth ? " routing-active" : ""}`}>
       {notice && (
         <div className={`notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>
           {notice.kind === "error" ? <X size={16} /> : <Check size={16} />}
@@ -331,11 +374,45 @@ function App() {
       )}
 
       <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            <ShieldCheck size={21} />
-          </span>
-          <h1>CSwitch</h1>
+        <h1 className="sr-only">CSwitch</h1>
+        <div className="route-control">
+          <button
+            id="resident-route"
+            className={`switch${state.keepOfficialAuth ? " on" : ""}`}
+            type="button"
+            role="switch"
+            aria-checked={state.keepOfficialAuth}
+            aria-labelledby="resident-route-label"
+            aria-busy={busy === "keep-auth"}
+            disabled={locked}
+            onClick={() => void toggleKeepOfficialAuth()}
+          >
+            <span />
+          </button>
+          <label id="resident-route-label" htmlFor="resident-route">常驻本地路由</label>
+          <details
+            className="route-help"
+            onBlur={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.currentTarget.open = false;
+                event.currentTarget.querySelector("summary")?.focus();
+              }
+            }}
+          >
+            <summary aria-label="路由说明" title="路由说明"><Info size={16} /></summary>
+            <div className="route-help-content">
+              <strong>切换第三方时保留官方登录</strong>
+              <p>
+                {state.keepOfficialAuth
+                  ? state.officialAuthAvailable ? "官方登录态已保留，请求使用当前供应商 API Key。" : "尚未保存官方登录，本次使用 API Key；完成官方登录后可保留。"
+                  : "当前是 API Key 直连，会写入 auth.json。开启后保留 ChatGPT 登录，请求改走 API Key。"}
+                {!state.officialAuthAvailable && " 建议先完成一次官方登录再开启。"}
+              </p>
+            </div>
+          </details>
         </div>
         <button className="add-button" type="button" aria-label="添加供应商" title="添加供应商" disabled={locked} onClick={openAdd}>
           <Plus size={19} />
@@ -367,36 +444,10 @@ function App() {
             )}
           </article>
 
-          <article className="auth-mode-card">
-            <div className="auth-mode-copy">
-              <strong>切换第三方时保留官方登录</strong>
-              <p>
-                {state.keepOfficialAuth
-                  ? state.officialAuthAvailable ? "官方登录态已保留，请求使用当前供应商 API Key。" : "尚未保存官方登录，本次使用 API Key；完成官方登录后可保留。"
-                  : "当前是 API Key 直连，会写入 auth.json。开启后保留 ChatGPT 登录，请求改走 API Key。"}
-                {!state.officialAuthAvailable && " 建议先完成一次官方登录再开启。"}
-              </p>
-            </div>
-            <button
-              className={`switch${state.keepOfficialAuth ? " on" : ""}`}
-              type="button"
-              role="switch"
-              aria-checked={state.keepOfficialAuth}
-              aria-label="切换第三方时保留官方登录"
-              disabled={locked}
-              onClick={() => void toggleKeepOfficialAuth()}
-            >
-              <span />
-            </button>
-          </article>
         </section>
 
-        <div className="section-heading">
-          <h2>API 供应商</h2>
-          <span className="count-badge">{state.providers.length}</span>
-        </div>
-
         <section className="provider-list" aria-label="API 供应商列表" aria-busy={isLoading}>
+          <h2 className="sr-only">API 供应商</h2>
           {isLoading && <div className="loading-row"><LoaderCircle className="spinner" size={22} /></div>}
           {!isLoading && state.providers.length === 0 && (
             <div className="empty-state">

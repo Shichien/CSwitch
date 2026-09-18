@@ -147,6 +147,10 @@ pub fn begin_login() -> Result<LoginAttempt, Box<dyn Error>> {
     Ok(LoginAttempt(token))
 }
 
+pub(crate) fn current_login_cancellation() -> Result<Option<Arc<AtomicBool>>, Box<dyn Error>> {
+    Ok(LOGIN.lock().map_err(|_| "登录任务锁状态异常")?.clone())
+}
+
 pub fn cancel_login() {
     if let Ok(current) = LOGIN.lock()
         && let Some(token) = current.as_ref()

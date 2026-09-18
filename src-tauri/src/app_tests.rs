@@ -4,6 +4,13 @@ use crate::profiles::AppSettings;
 use base64::Engine;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+use toml_edit::Item;
+
+#[path = "resident_tests.rs"]
+mod resident_tests;
+
+#[path = "import_tests.rs"]
+mod import_tests;
 
 fn official_auth(expires_at: i64, refresh_token: &str) -> Vec<u8> {
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
@@ -569,10 +576,14 @@ fn official_selection_skips_custom_auth_and_reuses_current_token() {
     let custom = build_custom_auth("fixture-key").expect("custom auth");
     let official = official_auth(chrono::Utc::now().timestamp() + 3600, "refresh");
     let mut refresh_calls = 0;
-    let selected = select_official_auth_with(&[custom, official.clone()], |_| {
-        refresh_calls += 1;
-        Err("refresh should not run".into())
-    })
+    let selected = select_official_auth_with(
+        &[custom, official.clone()],
+        |auth| Ok(AuthHealth::Valid(auth.to_vec())),
+        |_| {
+            refresh_calls += 1;
+            Err("refresh should not run".into())
+        },
+    )
     .expect("select current auth")
     .expect("official auth");
     assert_eq!(selected, official);
@@ -585,10 +596,14 @@ fn official_selection_refreshes_only_an_expiring_candidate() {
     let expiring = official_auth(chrono::Utc::now().timestamp() + 60, "old-refresh");
     let refreshed = official_auth(chrono::Utc::now().timestamp() + 3600, "new-refresh");
     let mut refresh_calls = 0;
-    let selected = select_official_auth_with(&[custom, expiring], |_| {
-        refresh_calls += 1;
-        Ok(AuthHealth::Valid(refreshed.clone()))
-    })
+    let selected = select_official_auth_with(
+        &[custom, expiring],
+        |_| panic!("expired token must not be validated"),
+        |_| {
+            refresh_calls += 1;
+            Ok(AuthHealth::Valid(refreshed.clone()))
+        },
+    )
     .expect("select refreshed auth")
     .expect("official auth");
     assert_eq!(selected, refreshed);
@@ -596,7 +611,8 @@ fn official_selection_refreshes_only_an_expiring_candidate() {
 }
 
 #[test]
-fn keep_official_auth_preserves_chatgpt_tokens_and_writes_bearer_token() {
+#[ignore = "uses CSWITCH_TEST_BINARY; run scripts/run-process-tests.py"]
+fn keep_official_auth_preserves_chatgpt_tokens_and_only_changes_route() {
     let directory = tempdir().expect("tempdir");
     let codex_home = directory.path();
     let official_config = b"model = \"official-model\"\napproval_policy = \"never\"\n";
@@ -613,6 +629,7 @@ fn keep_official_auth_preserves_chatgpt_tokens_and_writes_bearer_token() {
     ProfileStore::new(codex_home)
         .save_settings(&AppSettings {
             keep_official_auth: true,
+            ..Default::default()
         })
         .expect("enable keep official auth");
 
@@ -626,13 +643,21 @@ fn keep_official_auth_preserves_chatgpt_tokens_and_writes_bearer_token() {
     let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
     let document = parse_config(&config).expect("parse config");
     assert_eq!(
-        document["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("provider-key")
+        document["model_provider"].as_str(),
+        Some(config::HTTP_ROUTE_PROVIDER_ID)
     );
     assert_eq!(
-        document["model_providers"]["custom"]["name"].as_str(),
-        Some("供应商")
+        document["model_providers"][config::HTTP_ROUTE_PROVIDER_ID]["supports_websockets"]
+            .as_bool(),
+        Some(false)
     );
+    assert!(
+        document["model_providers"][config::HTTP_ROUTE_PROVIDER_ID]["base_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:")
+    );
+    assert!(!config.contains("provider-key"));
     let state = list_provider_state(codex_home).expect("provider state");
     assert_eq!(
         state.active_provider_id.as_deref(),
@@ -652,6 +677,11 @@ fn keep_official_auth_preserves_chatgpt_tokens_and_writes_bearer_token() {
     activate_provider_inner_with_close(codex_home, &second.id, || Ok(false))
         .expect("switch to second provider");
     assert_eq!(
+        fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+        config,
+        "hot switching must retain the existing address and configuration bytes"
+    );
+    assert_eq!(
         fs::read(codex_home.join("auth.json")).unwrap(),
         official_auth
     );
@@ -666,10 +696,12 @@ fn keep_official_auth_preserves_chatgpt_tokens_and_writes_bearer_token() {
         .as_deref(),
         Some("provider-key")
     );
+    gateway::stop(codex_home).unwrap();
 }
 
 #[test]
-fn disabling_keep_official_auth_writes_the_api_key_into_auth() {
+#[ignore = "uses CSWITCH_TEST_BINARY; run scripts/run-process-tests.py"]
+fn disabling_official_route_restores_address_and_preserves_auth() {
     let directory = tempdir().expect("tempdir");
     let codex_home = directory.path();
     let official_auth = official_auth(chrono::Utc::now().timestamp() + 3600, "refresh");
@@ -689,6 +721,7 @@ fn disabling_keep_official_auth_writes_the_api_key_into_auth() {
     ProfileStore::new(codex_home)
         .save_settings(&AppSettings {
             keep_official_auth: true,
+            ..Default::default()
         })
         .expect("enable keep official auth");
     activate_provider_inner_with_close(codex_home, &provider.id, || Ok(false))
@@ -700,17 +733,18 @@ fn disabling_keep_official_auth_writes_the_api_key_into_auth() {
 
     set_keep_official_auth_inner(codex_home, false).expect("disable keep official auth");
     assert_eq!(
-        api_key_from_auth(&fs::read(codex_home.join("auth.json")).unwrap())
+        fs::read(codex_home.join("auth.json")).unwrap(),
+        official_auth
+    );
+    assert!(
+        !fs::read_to_string(codex_home.join("config.toml"))
             .unwrap()
-            .as_deref(),
-        Some("provider-key")
+            .contains("openai_base_url")
     );
     let state = list_provider_state(codex_home).expect("provider state");
     assert!(!state.keep_official_auth);
-    assert_eq!(
-        state.active_provider_id.as_deref(),
-        Some(provider.id.as_str())
-    );
+    assert!(state.active_provider_id.is_none());
+    assert!(state.official_active);
 }
 
 #[test]
@@ -811,4 +845,534 @@ fn cleanup_failure_keeps_provider_list_and_reports_warning() {
     assert_eq!(state.providers[0].id, record.id);
     assert_eq!(state.warnings.len(), 1);
     assert!(state.warnings[0].contains("config.toml"));
+}
+
+#[test]
+#[ignore = "uses CSWITCH_TEST_BINARY; run scripts/run-process-tests.py"]
+#[allow(clippy::result_large_err)] // tungstenite handshake callback requires an HTTP error response by value.
+fn official_route_migrates_history_and_keeps_legacy_websocket_clients_working() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::thread;
+    use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
+    let home = tempdir().unwrap();
+    let root = home.path();
+    let auth = official_auth(chrono::Utc::now().timestamp() + 3600, "fixture-refresh");
+    let value: Value = serde_json::from_slice(&auth).unwrap();
+    let official_token = value["tokens"]["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fs::write(root.join("auth.json"), &auth).unwrap();
+    fs::write(
+        root.join("config.toml"),
+        b"model = 'unchanged-model'\nopenai_base_url = 'https://original.example/v1'\n",
+    )
+    .unwrap();
+    fs::create_dir(root.join("sessions")).unwrap();
+    fs::write(
+        root.join("sessions/rollout-fixture.jsonl"),
+        b"{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\"}}\n",
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(root.join("state_5.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT); INSERT INTO threads VALUES ('fixture', 'openai');").unwrap();
+    drop(db);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_url = format!("http://{}", listener.local_addr().unwrap());
+    let provider = save_fixture_provider(
+        root,
+        "fixture",
+        &api_url,
+        "upstream-fixture-key",
+        &["model"],
+    );
+    let server = thread::spawn(move || {
+        for expected in ["/responses", "/responses/compact"] {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with(&format!("POST {expected} ")));
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse::<usize>().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer upstream-fixture-key")
+            );
+            assert!(!headers.to_ascii_lowercase().contains("chatgpt-account-id"));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(
+                body,
+                br#"{"model":"do-not-change","input":"fixture","stream":true}"#
+            );
+            let payload = "data: {\"type\":\"response.completed\",\"fixture\":true}\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).as_bytes()).unwrap();
+        }
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        let mut socket = tungstenite::accept_hdr(
+            socket,
+            |request: &tungstenite::handshake::server::Request, response| {
+                assert_eq!(request.uri().path(), "/responses");
+                assert_eq!(
+                    request.headers()["authorization"],
+                    "Bearer upstream-fixture-key"
+                );
+                assert!(request.headers().get("ChatGPT-Account-Id").is_none());
+                Ok(response)
+            },
+        )
+        .unwrap();
+        let message = socket.read().unwrap();
+        assert_eq!(message.to_text().unwrap(), "websocket-fixture");
+        socket.send(message).unwrap();
+        drop(socket);
+        let (mut denied, _) = listener.accept().unwrap();
+        // An HTTP-only provider must retain its original handshake status for the client.
+        let mut bytes = [0u8; 4096];
+        let _ = denied.read(&mut bytes).unwrap();
+        denied.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    });
+    let state = set_keep_official_auth_inner(root, true).unwrap();
+    assert_eq!(
+        state.active_provider_id.as_deref(),
+        Some(provider.id.as_str())
+    );
+    assert!(!state.official_active);
+    let routed = fs::read_to_string(root.join("config.toml")).unwrap();
+    assert_eq!(
+        config::selected_provider(&routed).unwrap(),
+        config::HTTP_ROUTE_PROVIDER_ID
+    );
+    let url = config::provider_base_url(&routed, config::HTTP_ROUTE_PROVIDER_ID)
+        .unwrap()
+        .unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    assert_eq!(
+        client
+            .post(format!("{url}/responses"))
+            .bearer_auth("wrong-token")
+            .body("{}")
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    for suffix in ["/responses", "/responses/compact"] {
+        let response = client
+            .post(format!("{url}{suffix}"))
+            .bearer_auth(&official_token)
+            .header("ChatGPT-Account-Id", "must-not-leak")
+            .header("Content-Type", "application/json")
+            .body(r#"{"model":"do-not-change","input":"fixture","stream":true}"#)
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert!(response.text().unwrap().contains("response.completed"));
+    }
+    let mut request = format!("{url}/responses")
+        .replacen("http:", "ws:", 1)
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {official_token}").parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert("ChatGPT-Account-Id", "must-not-leak".parse().unwrap());
+    let (mut websocket, _) = tungstenite::connect(request).unwrap();
+    websocket
+        .send(Message::Text("websocket-fixture".into()))
+        .unwrap();
+    assert_eq!(
+        websocket.read().unwrap().to_text().unwrap(),
+        "websocket-fixture"
+    );
+    drop(websocket);
+    let mut denied_request = format!("{url}/responses")
+        .replacen("http:", "ws:", 1)
+        .into_client_request()
+        .unwrap();
+    denied_request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {official_token}").parse().unwrap(),
+    );
+    assert!(
+        matches!(tungstenite::connect(denied_request), Err(tungstenite::Error::Http(response)) if response.status().as_u16()==405)
+    );
+    server.join().unwrap();
+    fs::write(
+        root.join("config.toml"),
+        format!("model_verbosity = 'high'\n{routed}"),
+    )
+    .unwrap();
+    set_keep_official_auth_inner(root, false).unwrap();
+    let restored = fs::read_to_string(root.join("config.toml")).unwrap();
+    assert_eq!(
+        config::provider_base_url(&restored, "openai")
+            .unwrap()
+            .as_deref(),
+        Some("https://original.example/v1")
+    );
+    assert!(restored.contains("model_verbosity = 'high'"));
+    assert_eq!(fs::read(root.join("auth.json")).unwrap(), auth);
+    let db = rusqlite::Connection::open(root.join("state_5.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT model_provider FROM threads", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "openai"
+    );
+    assert!(
+        fs::read_to_string(root.join("sessions/rollout-fixture.jsonl"))
+            .unwrap()
+            .contains("\"model_provider\":\"openai\"")
+    );
+}
+
+#[test]
+#[ignore = "uses CSWITCH_TEST_BINARY; run scripts/run-process-tests.py"]
+fn custom_mode_route_keeps_provider_and_restores_api_auth_without_history_scan() {
+    let home = tempdir().unwrap();
+    let root = home.path();
+    let official = official_auth(chrono::Utc::now().timestamp() + 3600, "fixture-refresh");
+    fs::write(root.join("auth.json"), &official).unwrap();
+    fs::write(root.join("config.toml"), b"model='original'\n").unwrap();
+    let provider = save_fixture_provider(
+        root,
+        "fixture",
+        "https://fixture.test",
+        "fixture-key",
+        &["model"],
+    );
+    activate_provider_inner_with_close(root, &provider.id, || Ok(false)).unwrap();
+    let before = fs::read(root.join("config.toml")).unwrap();
+    fs::write(root.join("state_5.sqlite"), b"do-not-scan").unwrap();
+    set_keep_official_auth_inner(root, true).unwrap();
+    let routed = fs::read_to_string(root.join("config.toml")).unwrap();
+    assert_eq!(config::selected_provider(&routed).unwrap(), "custom");
+    assert_eq!(fs::read(root.join("auth.json")).unwrap(), official);
+    set_keep_official_auth_inner(root, false).unwrap();
+    assert_eq!(fs::read(root.join("config.toml")).unwrap(), before);
+    assert_eq!(
+        api_key_from_auth(&fs::read(root.join("auth.json")).unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("fixture-key")
+    );
+    assert_eq!(
+        fs::read(root.join("state_5.sqlite")).unwrap(),
+        b"do-not-scan"
+    );
+}
+
+#[test]
+fn disabling_legacy_keep_auth_uses_small_transaction_and_retains_latest_official_tokens() {
+    let home = tempdir().unwrap();
+    let root = home.path();
+    let auth = official_auth(chrono::Utc::now().timestamp() + 3600, "latest-refresh");
+    let record = save_fixture_provider(
+        root,
+        "fixture",
+        "https://fixture.test",
+        "fixture-key",
+        &["model"],
+    );
+    let profiles = ProfileStore::new(root);
+    let config = String::from_utf8(profiles.load_provider(&record.id).unwrap().config).unwrap();
+    fs::write(
+        root.join("config.toml"),
+        format!("{config}\nexperimental_bearer_token = 'fixture-key'\n"),
+    )
+    .unwrap();
+    fs::write(root.join("auth.json"), &auth).unwrap();
+    fs::write(root.join("state_5.sqlite"), b"must-not-open").unwrap();
+    profiles
+        .save_settings(&AppSettings {
+            keep_official_auth: true,
+            ..Default::default()
+        })
+        .unwrap();
+    set_keep_official_auth_inner(root, false).unwrap();
+    assert_eq!(profiles.load_official().unwrap().unwrap().auth, auth);
+    assert_eq!(
+        api_key_from_auth(&fs::read(root.join("auth.json")).unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("fixture-key")
+    );
+    assert!(
+        !fs::read_to_string(root.join("config.toml"))
+            .unwrap()
+            .contains("experimental_bearer_token")
+    );
+    assert_eq!(
+        fs::read(root.join("state_5.sqlite")).unwrap(),
+        b"must-not-open"
+    );
+}
+
+#[test]
+fn disabling_custom_route_saves_rotated_official_credentials() {
+    let home = tempdir().unwrap();
+    let root = home.path();
+    let provider = save_fixture_provider(
+        root,
+        "fixture",
+        "https://fixture.test",
+        "fixture-key",
+        &["model"],
+    );
+    let store = ProfileStore::new(root);
+    let stale = official_auth(chrono::Utc::now().timestamp() + 3600, "old-refresh");
+    let fresh = official_auth(chrono::Utc::now().timestamp() + 7200, "rotated-refresh");
+    store.save_official(b"model='original'\n", &stale).unwrap();
+    let source = String::from_utf8(store.load_provider(&provider.id).unwrap().config).unwrap();
+    let routed =
+        config::with_provider_base_url(&source, "custom", Some("http://127.0.0.1:1234/v1"))
+            .unwrap();
+    fs::write(root.join("config.toml"), &routed).unwrap();
+    fs::write(root.join("auth.json"), &fresh).unwrap();
+    store
+        .save_settings(&AppSettings {
+            keep_official_auth: true,
+            official_route: Some(profiles::OfficialRoute {
+                resident: false,
+                http_transport: None,
+                direct_provider_id: None,
+                provider_id: provider.id,
+                config_provider: "custom".into(),
+                previous_base_url: Some("https://fixture.test".into()),
+                local_base_url: "http://127.0.0.1:1234/v1".into(),
+            }),
+        })
+        .unwrap();
+    stop_official_route(root, false).unwrap();
+    assert_eq!(
+        store.load_official().unwrap().unwrap().auth,
+        fresh,
+        "latest refresh token lost when returning to API key mode"
+    );
+    assert_eq!(
+        api_key_from_auth(&fs::read(root.join("auth.json")).unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("fixture-key")
+    );
+}
+
+#[test]
+fn auth_transitions_stop_writer_and_read_its_final_rotation() {
+    let home = tempdir().unwrap();
+    let auth = home.path().join("auth.json");
+    let initial = official_auth(chrono::Utc::now().timestamp() + 3600, "old");
+    let latest = official_auth(chrono::Utc::now().timestamp() + 7200, "latest");
+    fs::write(&auth, &initial).unwrap();
+    assert_eq!(
+        read_auth_for_transition(home.path(), None, || panic!(
+            "address-only change must not close Codex"
+        ))
+        .unwrap(),
+        Some(initial.clone())
+    );
+    let api = build_custom_auth("fixture-key").unwrap();
+    assert_eq!(
+        read_auth_for_transition(home.path(), Some(&api), || {
+            fs::write(&auth, &latest)?;
+            Ok(true)
+        })
+        .unwrap(),
+        Some(latest.clone())
+    );
+    assert_eq!(fs::read(&auth).unwrap(), latest);
+    fs::write(&auth, &api).unwrap();
+    assert!(
+        read_auth_for_transition(home.path(), None, || Err("fixture access denied".into()))
+            .is_err()
+    );
+    assert_eq!(fs::read(&auth).unwrap(), api);
+}
+
+#[test]
+fn official_snapshot_never_restores_a_retired_local_proxy() {
+    let home = tempdir().unwrap();
+    let store = ProfileStore::new(home.path());
+    store
+        .save_settings(&AppSettings {
+            keep_official_auth: true,
+            official_route: Some(profiles::OfficialRoute {
+                resident: false,
+                http_transport: None,
+                direct_provider_id: None,
+                provider_id: "fixture".into(),
+                config_provider: "openai".into(),
+                previous_base_url: Some("https://original.test/v1".into()),
+                local_base_url: "http://127.0.0.1:1234/v1".into(),
+            }),
+        })
+        .unwrap();
+    let original = "openai_base_url = 'http://127.0.0.1:1234/v1'\nmodel='unchanged'\n";
+    let snapshot = official_snapshot_config(original, &store).unwrap();
+    assert_eq!(
+        config::provider_base_url(&snapshot, "openai")
+            .unwrap()
+            .as_deref(),
+        Some("https://original.test/v1")
+    );
+    assert!(snapshot.contains("model='unchanged'"));
+    let external = "openai_base_url = 'https://user-edited.test'\n";
+    assert_eq!(
+        official_snapshot_config(external, &store).unwrap(),
+        external
+    );
+}
+
+#[test]
+fn http_route_restores_original_transport_and_preserves_user_edits() {
+    for (source, provider) in [
+        (
+            "# original\nmodel='original'\n[desktop]\nlocaleOverride='en-US'\n",
+            "openai",
+        ),
+        (
+            "model_provider = 'openai' # explicit\nmodel='original'\nopenai_base_url='https://official.test/api'\n[model_providers.other]\nname='keep'\nsupports_websockets=true\n",
+            "openai",
+        ),
+        (
+            "model_provider='custom'\nmodel='original'\n[model_providers.custom]\nname='Existing'\nbase_url='https://third.test'\nsupports_websockets=true\n",
+            "custom",
+        ),
+        (
+            "model_provider='custom'\nmodel='original'\n[model_providers.custom]\nname='Existing'\nbase_url='https://third.test'\nsupports_websockets=false\n",
+            "custom",
+        ),
+        (
+            "model_provider='custom'\nmodel='original'\n[model_providers.custom]\nname='Existing'\nbase_url='https://third.test'\n",
+            "custom",
+        ),
+    ] {
+        let route = profiles::OfficialRoute {
+            provider_id: "fixture".into(),
+            config_provider: provider.into(),
+            previous_base_url: config::provider_base_url(source, provider).unwrap(),
+            local_base_url: "http://127.0.0.1:1234/v1".into(),
+            resident: true,
+            direct_provider_id: None,
+            http_transport: Some(config::capture_route_transport(source, provider).unwrap()),
+        };
+        let updated = config::with_http_route(source, provider, &route.local_base_url).unwrap();
+        verify_route_config(&updated, &route).unwrap();
+        let edited = updated.replace("model='original'", "model='user-edited'");
+        let restored = config::restore_route_config(&edited, &route).unwrap();
+        assert!(restored.contains("model='user-edited'"));
+        assert_eq!(config::selected_provider(&restored).unwrap(), provider);
+        assert_eq!(
+            config::provider_base_url(&restored, provider).unwrap(),
+            route.previous_base_url
+        );
+        assert_eq!(
+            config::provider_websockets(&restored, provider).unwrap(),
+            route.http_transport.as_ref().unwrap().previous_websockets
+        );
+        assert!(!restored.contains(config::HTTP_ROUTE_PROVIDER_ID));
+        if source.contains("[desktop]") {
+            assert!(restored.contains("[desktop]\nlocaleOverride='en-US'"));
+        }
+        if source.contains("[model_providers.other]") {
+            assert!(
+                restored.contains("[model_providers.other]\nname='keep'\nsupports_websockets=true")
+            );
+            assert!(restored.contains("'openai' # explicit"));
+        }
+        let conflicted =
+            config::with_provider_websockets(&updated, route.active_config_provider(), Some(true))
+                .unwrap();
+        assert!(verify_route_config(&conflicted, &route).is_err());
+        let home = tempdir().unwrap();
+        let store = ProfileStore::new(home.path());
+        store
+            .save_settings(&AppSettings {
+                keep_official_auth: true,
+                official_route: Some(route),
+            })
+            .unwrap();
+        if provider == "openai" {
+            assert_eq!(official_snapshot_config(&edited, &store).unwrap(), restored);
+        }
+    }
+    assert!(
+        config::capture_route_transport(
+            "[model_providers.cswitch_local]\nname='user-owned'\n",
+            "openai"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn official_selection_does_not_hide_network_errors_by_trying_old_credentials() {
+    let auth = official_auth(chrono::Utc::now().timestamp() + 3600, "live");
+    let saved = official_auth(chrono::Utc::now().timestamp() + 3600, "saved");
+    let mut calls = 0;
+    let result = select_official_auth_with(
+        &[auth, saved],
+        |_| {
+            calls += 1;
+            Err("fixture network failure".into())
+        },
+        |_| panic!("refresh not expected"),
+    );
+    assert!(result.is_err());
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn imports_named_provider_even_after_registry_exists() {
+    let home = tempdir().unwrap();
+    let store = ProfileStore::new(home.path());
+    store.ensure_provider_registry().unwrap();
+    let config = b"model_provider = 'my-provider'\n[model_providers.my-provider]\nname = 'Imported'\nbase_url = 'https://import.example/v1'\nrequires_openai_auth = true\n";
+    let auth = build_custom_auth("import-key").unwrap();
+    fs::write(home.path().join("config.toml"), config).unwrap();
+    fs::write(home.path().join("auth.json"), &auth).unwrap();
+    ensure_provider_migration(home.path()).unwrap();
+    let records = store.list_providers().unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "selected named provider must be discovered"
+    );
+    assert_eq!(records[0].name, "Imported");
+    assert_eq!(
+        detect_active_provider_id(home.path(), &store, &records).unwrap(),
+        Some(records[0].id.clone())
+    );
+    ensure_provider_migration(home.path()).unwrap();
+    assert_eq!(store.list_providers().unwrap().len(), 1);
+    assert_eq!(fs::read(home.path().join("config.toml")).unwrap(), config);
+    assert_eq!(fs::read(home.path().join("auth.json")).unwrap(), auth);
 }

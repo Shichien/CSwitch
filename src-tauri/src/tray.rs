@@ -92,7 +92,7 @@ fn tooltip() -> String {
 
 fn build_menu(app: &AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn Error>> {
     let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出并停止路由", true, None::<&str>)?;
     let top_sep = PredefinedMenuItem::separator(app)?;
     let bottom_sep = PredefinedMenuItem::separator(app)?;
 
