@@ -229,25 +229,6 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
             )
             .unwrap();
     });
-    let upstream_b = thread::spawn(move || {
-        for _ in 0..2 {
-            fixture_request(&b, "key-b", false)
-                .respond(Response::from_string("b"))
-                .unwrap();
-        }
-    });
-    let official_token = token.clone();
-    let upstream_official = thread::spawn(move || {
-        let req = fixture_request(&official_server, &official_token, true);
-        assert_eq!(req.url(), "/official/models?client_version=fixture");
-        req.respond(Response::from_string(
-            r#"{"models":[{"slug":"original","context_window":12345}]}"#,
-        ))
-        .unwrap();
-        fixture_request(&official_server, &official_token, true)
-            .respond(Response::from_string("official-401").with_status_code(401))
-            .unwrap();
-    });
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(15))
@@ -277,6 +258,14 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
     });
     received_rx.recv_timeout(Duration::from_secs(15)).unwrap();
     activate_provider_inner_with_close(home, &pb.id, || panic!("hot switch closed Codex")).unwrap();
+    // Start each fixture receive deadline only in the phase that sends its request.
+    // The listener stays alive across switches, without an idle receiver timing out.
+    let upstream_b = thread::spawn(move || {
+        fixture_request(&b, "key-b", false)
+            .respond(Response::from_string("b"))
+            .unwrap();
+        b
+    });
     assert_eq!(
         client
             .post(format!("{base}/responses"))
@@ -289,6 +278,7 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
             .unwrap(),
         "b"
     );
+    let b = upstream_b.join().unwrap();
     complete_tx.send(()).unwrap();
     assert!(inflight.join().unwrap().contains("\"route\":\"a\""));
     for i in 0..20 {
@@ -305,6 +295,18 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
     let state = list_provider_state_read_only(home).unwrap();
     assert!(state.official_active);
     assert!(state.active_provider_id.is_none());
+    let official_token = token.clone();
+    let upstream_official = thread::spawn(move || {
+        let req = fixture_request(&official_server, &official_token, true);
+        assert_eq!(req.url(), "/official/models?client_version=fixture");
+        req.respond(Response::from_string(
+            r#"{"models":[{"slug":"original","context_window":12345}]}"#,
+        ))
+        .unwrap();
+        fixture_request(&official_server, &official_token, true)
+            .respond(Response::from_string("official-401").with_status_code(401))
+            .unwrap();
+    });
     let response = client
         .get(format!("{base}/models?client_version=fixture"))
         .bearer_auth(&token)
@@ -334,6 +336,11 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_bytes);
     drop(occupied);
     gateway::restore_resident(home).unwrap();
+    let upstream_b = thread::spawn(move || {
+        fixture_request(&b, "key-b", false)
+            .respond(Response::from_string("b"))
+            .unwrap();
+    });
     assert_eq!(
         client
             .post(format!("{base}/responses/compact"))
