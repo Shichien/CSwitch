@@ -22,6 +22,51 @@ export interface OfficialAccountSummary {
   loginRetained: boolean;
 }
 
+export type OfficialAccountHealth = "valid" | "reauth_required" | "unknown";
+
+export interface OfficialQuotaWindow {
+  name: string;
+  usedPercent: number;
+  resetAt: number | null;
+  windowSeconds: number | null;
+}
+
+export interface OfficialCredits {
+  hasCredits: boolean;
+  unlimited: boolean;
+  balance: string | null;
+}
+
+export interface OfficialAccountUsage {
+  accountId: string;
+  health: OfficialAccountHealth;
+  plan: string | null;
+  windows: OfficialQuotaWindow[];
+  credits: OfficialCredits | null;
+  message: string | null;
+  queriedAt: number;
+}
+
+export type ProviderUsageStatus =
+  | "available"
+  | "unsupported"
+  | "unauthorized"
+  | "unknown";
+
+export interface ProviderUsage {
+  providerId: string;
+  status: ProviderUsageStatus;
+  system: string | null;
+  balance: number | null;
+  total: number | null;
+  used: number | null;
+  unit: string | null;
+  unlimited: boolean;
+  plan: string | null;
+  message: string | null;
+  queriedAt: number;
+}
+
 export interface ProviderState {
   officialAccounts: OfficialAccountSummary[];
   warnings: string[];

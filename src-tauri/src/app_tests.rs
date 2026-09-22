@@ -65,6 +65,89 @@ fn save_fixture_provider(
         .expect("save provider")
 }
 
+fn file_contents(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(directory).expect("read fixture directory") {
+            let entry = entry.expect("read fixture entry");
+            let file_type = entry.file_type().expect("fixture file type");
+            if file_type.is_dir() {
+                visit(root, &entry.path(), files);
+            } else if file_type.is_file() {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("relative fixture path")
+                    .to_path_buf();
+                files.insert(relative, fs::read(entry.path()).expect("read fixture file"));
+            }
+        }
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[test]
+fn provider_usage_query_reads_saved_credentials_without_changing_codex_files() {
+    use std::thread;
+    use tiny_http::{Header, Response, Server, StatusCode};
+
+    let directory = tempdir().expect("tempdir");
+    let codex_home = directory.path();
+    fs::write(codex_home.join("config.toml"), b"model = 'fixture-model'\n")
+        .expect("write live config");
+    fs::write(
+        codex_home.join("auth.json"),
+        b"{\"OPENAI_API_KEY\":\"live-key\"}",
+    )
+    .expect("write live auth");
+
+    let server = Server::http("127.0.0.1:0").expect("server");
+    let api_url = format!("http://{}", server.server_addr());
+    let provider = save_fixture_provider(
+        codex_home,
+        "SUB2API fixture",
+        &api_url,
+        "saved-provider-key",
+        &["fixture-model"],
+    );
+    let before = file_contents(codex_home);
+
+    let task = thread::spawn(move || {
+        let request = server.recv().expect("usage request");
+        assert_eq!(request.url(), "/v1/usage");
+        let authorization = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Authorization"))
+            .expect("authorization header");
+        assert_eq!(authorization.value.as_str(), "Bearer saved-provider-key");
+        request
+            .respond(
+                Response::from_string(
+                    r#"{"mode":"unrestricted","isValid":true,"planName":"钱包余额","remaining":18.5,"balance":18.5,"unit":"USD"}"#,
+                )
+                .with_status_code(StatusCode(200))
+                .with_header(
+                    Header::from_bytes("Content-Type", "application/json")
+                        .expect("content type"),
+                ),
+            )
+            .expect("usage response");
+    });
+
+    let usage = query_provider_usage(codex_home, &provider.id).expect("query provider usage");
+    task.join().expect("usage server");
+    assert_eq!(usage.status, provider_usage::ProviderUsageStatus::Available);
+    assert_eq!(usage.balance, Some(18.5));
+    assert_eq!(file_contents(codex_home), before);
+}
+
 #[test]
 fn operation_errors_include_home_stage_and_reason() {
     let error = operation_error(
@@ -607,6 +690,30 @@ fn official_selection_refreshes_only_an_expiring_candidate() {
     .expect("select refreshed auth")
     .expect("official auth");
     assert_eq!(selected, refreshed);
+    assert_eq!(refresh_calls, 1);
+}
+
+#[test]
+fn official_selection_refreshes_a_current_token_rejected_by_server() {
+    let current = official_auth(chrono::Utc::now().timestamp() + 3600, "old-refresh");
+    let refreshed = official_auth(chrono::Utc::now().timestamp() + 7200, "new-refresh");
+    let mut validate_calls = 0;
+    let mut refresh_calls = 0;
+    let selected = select_official_auth_with(
+        &[current],
+        |_| {
+            validate_calls += 1;
+            Ok(AuthHealth::Invalid)
+        },
+        |_| {
+            refresh_calls += 1;
+            Ok(AuthHealth::Valid(refreshed.clone()))
+        },
+    )
+    .expect("select refreshed auth")
+    .expect("official auth");
+    assert_eq!(selected, refreshed);
+    assert_eq!(validate_calls, 1);
     assert_eq!(refresh_calls, 1);
 }
 

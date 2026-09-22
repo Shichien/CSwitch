@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use tauri::{AppHandle, Emitter};
 
 use crate::app::{
-    ProviderState, SavedProvider, activate_provider_inner_with_progress, delete_provider_inner,
-    enable_provider_routing_inner, ensure_provider_migration, list_provider_state,
-    save_provider_inner, set_keep_official_auth_with_progress, switch_to_official_with_progress,
+    OfficialAccountUsage, OfficialAccountUsageProbe, ProviderState, SavedProvider,
+    activate_provider_inner_with_progress, delete_provider_inner, enable_provider_routing_inner,
+    ensure_provider_migration, list_provider_state, probe_official_account_usage,
+    query_provider_usage as query_provider_usage_inner, save_provider_inner,
+    set_keep_official_auth_with_progress, switch_to_official_with_progress,
 };
 use crate::progress::{self, ProgressReporter};
 use crate::{oauth, operation_lock, provider_sync, tray};
@@ -28,6 +30,8 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
         }))
         .invoke_handler(tauri::generate_handler![
             list_providers,
+            query_official_account_usage,
+            query_provider_usage,
             refresh_provider_models,
             save_provider,
             enable_provider_routing,
@@ -121,6 +125,72 @@ fn list_providers_inner() -> Result<ProviderState, String> {
             .push(operation_error(&codex_home, "恢复常驻路由", error));
     }
     Ok(state)
+}
+
+#[tauri::command]
+async fn query_official_account_usage(account_id: String) -> Result<OfficialAccountUsage, String> {
+    let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
+    let initial_home = codex_home.clone();
+    let initial_id = account_id.clone();
+    let initial = tauri::async_runtime::spawn_blocking(move || {
+        probe_official_account_usage(&initial_home, &initial_id, false)
+            .map_err(|error| operation_error(&initial_home, "查询官方额度", error))
+    })
+    .await
+    .map_err(|error| operation_error(&codex_home, "等待官方额度查询", error))??;
+    match initial {
+        OfficialAccountUsageProbe::Ready(usage) => Ok(usage),
+        OfficialAccountUsageProbe::NeedsExclusiveRefresh => {
+            let task_home = codex_home.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _guard = match APP_OPERATION.try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::WouldBlock) => {
+                        return Ok(OfficialAccountUsage::unavailable(
+                            &account_id,
+                            "正在执行其他切换操作，请稍后刷新额度",
+                        ));
+                    }
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Err("CSwitch 操作锁状态异常，请重启程序".to_string());
+                    }
+                };
+                let _process_guard = match operation_lock::acquire(&task_home) {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return Ok(OfficialAccountUsage::unavailable(
+                            &account_id,
+                            "另一个 CSwitch 操作正在进行，请稍后刷新额度",
+                        ));
+                    }
+                };
+                match probe_official_account_usage(&task_home, &account_id, true)
+                    .map_err(|error| operation_error(&task_home, "刷新官方认证并查询额度", error))?
+                {
+                    OfficialAccountUsageProbe::Ready(usage) => Ok(usage),
+                    OfficialAccountUsageProbe::NeedsExclusiveRefresh => {
+                        Err("官方认证刷新状态未收敛".to_string())
+                    }
+                }
+            })
+            .await
+            .map_err(|error| operation_error(&codex_home, "等待官方认证刷新", error))?
+        }
+    }
+}
+
+#[tauri::command]
+async fn query_provider_usage(
+    provider_id: String,
+) -> Result<crate::provider_usage::ProviderUsage, String> {
+    let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
+    let task_home = codex_home.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        query_provider_usage_inner(&task_home, &provider_id)
+            .map_err(|error| operation_error(&task_home, "查询供应商余额", error))
+    })
+    .await
+    .map_err(|error| operation_error(&codex_home, "等待供应商余额查询", error))?
 }
 
 #[tauri::command]

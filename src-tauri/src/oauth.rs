@@ -4,7 +4,7 @@ use rand::RngCore;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -24,7 +24,9 @@ const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const USAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
+const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 static LOGIN: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
 pub(crate) struct LoginAttempt(Arc<AtomicBool>);
@@ -51,6 +53,72 @@ pub enum LocalAuthState {
     Current,
     NeedsRefresh,
     Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OfficialQuotaWindow {
+    pub name: String,
+    pub used_percent: f64,
+    pub reset_at: Option<i64>,
+    pub window_seconds: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OfficialCredits {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OfficialQuota {
+    pub plan: Option<String>,
+    pub windows: Vec<OfficialQuotaWindow>,
+    pub credits: Option<OfficialCredits>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum OfficialUsageFetch {
+    Available(OfficialQuota),
+    Rejected,
+    Unavailable(String),
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum OfficialUsageCheck {
+    Valid { auth: Vec<u8>, quota: OfficialQuota },
+    ReauthRequired,
+    Unavailable(String),
+}
+
+#[derive(Deserialize)]
+struct UsageWindowResponse {
+    used_percent: Option<f64>,
+    limit_window_seconds: Option<i64>,
+    reset_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RateLimitResponse {
+    primary_window: Option<UsageWindowResponse>,
+    secondary_window: Option<UsageWindowResponse>,
+}
+
+#[derive(Deserialize)]
+struct CreditsResponse {
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
+    balance: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct UsageResponse {
+    plan_type: Option<String>,
+    rate_limit: Option<RateLimitResponse>,
+    credits: Option<CreditsResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,7 +161,7 @@ fn validate_auth_with(
     }
     let response = request.send()?;
     match response.status() {
-        StatusCode::UNAUTHORIZED => Ok(AuthHealth::Invalid),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Ok(AuthHealth::Invalid),
         status if status.is_success() => {
             let result: Value = response
                 .json()
@@ -104,6 +172,164 @@ fn validate_auth_with(
             Ok(AuthHealth::Valid(auth.to_vec()))
         }
         status => Err(format!("官方认证检查返回 {status}，本地凭据已保留").into()),
+    }
+}
+
+pub(crate) fn fetch_official_usage(auth: &[u8]) -> OfficialUsageFetch {
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(error) => return OfficialUsageFetch::Unavailable(error.to_string()),
+    };
+    fetch_official_usage_with(&client, USAGE_URL, auth)
+}
+
+pub(crate) fn check_official_usage(auth: &[u8]) -> OfficialUsageCheck {
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(error) => return OfficialUsageCheck::Unavailable(error.to_string()),
+    };
+    check_official_usage_with(&client, USAGE_URL, &format!("{ISSUER}/oauth/token"), auth)
+}
+
+fn check_official_usage_with(
+    client: &Client,
+    usage_url: &str,
+    token_url: &str,
+    auth: &[u8],
+) -> OfficialUsageCheck {
+    match inspect_auth(auth) {
+        LocalAuthState::Invalid => OfficialUsageCheck::ReauthRequired,
+        LocalAuthState::NeedsRefresh => {
+            refresh_then_fetch_usage(client, usage_url, token_url, auth)
+        }
+        LocalAuthState::Current => match fetch_official_usage_with(client, usage_url, auth) {
+            OfficialUsageFetch::Available(quota) => OfficialUsageCheck::Valid {
+                auth: auth.to_vec(),
+                quota,
+            },
+            OfficialUsageFetch::Rejected => {
+                refresh_then_fetch_usage(client, usage_url, token_url, auth)
+            }
+            OfficialUsageFetch::Unavailable(message) => OfficialUsageCheck::Unavailable(message),
+        },
+    }
+}
+
+fn refresh_then_fetch_usage(
+    client: &Client,
+    usage_url: &str,
+    token_url: &str,
+    auth: &[u8],
+) -> OfficialUsageCheck {
+    let refreshed = match refresh_auth_with(client, token_url, auth) {
+        Ok(AuthHealth::Valid(auth)) => auth,
+        Ok(AuthHealth::Invalid) => return OfficialUsageCheck::ReauthRequired,
+        Err(error) => return OfficialUsageCheck::Unavailable(error.to_string()),
+    };
+    match fetch_official_usage_with(client, usage_url, &refreshed) {
+        OfficialUsageFetch::Available(quota) => OfficialUsageCheck::Valid {
+            auth: refreshed,
+            quota,
+        },
+        OfficialUsageFetch::Rejected => OfficialUsageCheck::ReauthRequired,
+        OfficialUsageFetch::Unavailable(message) => OfficialUsageCheck::Unavailable(message),
+    }
+}
+
+fn fetch_official_usage_with(client: &Client, endpoint: &str, auth: &[u8]) -> OfficialUsageFetch {
+    let document: Value = match serde_json::from_slice(auth) {
+        Ok(document) => document,
+        Err(_) => return OfficialUsageFetch::Rejected,
+    };
+    let Some(token) = token_field(&document, "access_token") else {
+        return OfficialUsageFetch::Rejected;
+    };
+    let mut request = client
+        .get(endpoint)
+        .timeout(USAGE_REQUEST_TIMEOUT)
+        .bearer_auth(token);
+    if let Some(account) = existing_account_id(&document) {
+        request = request.header("ChatGPT-Account-Id", account);
+    }
+    let response = match request.send() {
+        Ok(response) => response,
+        Err(error) => {
+            return OfficialUsageFetch::Unavailable(format!("额度查询网络错误：{error}"));
+        }
+    };
+    let status = response.status();
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return OfficialUsageFetch::Rejected;
+    }
+    if !status.is_success() {
+        return OfficialUsageFetch::Unavailable(format!("额度查询返回 {status}"));
+    }
+    let response: UsageResponse = match response.json() {
+        Ok(response) => response,
+        Err(error) => {
+            return OfficialUsageFetch::Unavailable(format!("额度查询响应格式异常：{error}"));
+        }
+    };
+    OfficialUsageFetch::Available(parse_usage_response(response))
+}
+
+fn parse_usage_response(response: UsageResponse) -> OfficialQuota {
+    let windows = response
+        .rate_limit
+        .into_iter()
+        .flat_map(|limit| [limit.primary_window, limit.secondary_window])
+        .flatten()
+        .filter_map(|window| {
+            let used_percent = window.used_percent?;
+            Some(OfficialQuotaWindow {
+                name: quota_window_name(window.limit_window_seconds),
+                used_percent: used_percent.clamp(0.0, 100.0),
+                reset_at: window.reset_at,
+                window_seconds: window.limit_window_seconds,
+            })
+        })
+        .collect();
+    let credits = response.credits.map(|credits| OfficialCredits {
+        has_credits: credits.has_credits.unwrap_or(false),
+        unlimited: credits.unlimited.unwrap_or(false),
+        balance: credits.balance.and_then(credit_balance),
+    });
+    OfficialQuota {
+        plan: response
+            .plan_type
+            .map(|plan| plan.trim().to_string())
+            .filter(|plan| !plan.is_empty()),
+        windows,
+        credits,
+    }
+}
+
+fn quota_window_name(seconds: Option<i64>) -> String {
+    match seconds {
+        Some(18_000) => "5 小时".to_string(),
+        Some(604_800) => "7 天".to_string(),
+        Some(2_592_000) => "30 天".to_string(),
+        Some(seconds) if seconds > 0 && seconds % 86_400 == 0 => {
+            format!("{} 天", seconds / 86_400)
+        }
+        Some(seconds) if seconds > 0 && seconds % 3_600 == 0 => {
+            format!("{} 小时", seconds / 3_600)
+        }
+        Some(seconds) if seconds > 0 => {
+            format!("{} 分钟", seconds / 60 + i64::from(seconds % 60 != 0))
+        }
+        _ => "额度".to_string(),
+    }
+}
+
+fn credit_balance(value: Value) -> Option<String> {
+    match value {
+        Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -318,7 +544,9 @@ fn refresh_auth_with(
     let status = response.status();
     let body = response.bytes()?;
     if !status.is_success() {
-        if status == StatusCode::UNAUTHORIZED || is_permanent_refresh_failure(&body) {
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            || is_permanent_refresh_failure(&body)
+        {
             return Ok(AuthHealth::Invalid);
         }
         return Err(token_service_error("官方登录测活", status, &body).into());
@@ -1145,6 +1373,138 @@ mod tests {
             Some("socks5://127.0.0.1:1080".to_string())
         );
         assert_eq!(parse_windows_proxy_server(""), None);
+    }
+
+    #[test]
+    fn parses_official_windows_and_credit_balance() {
+        let quota = parse_usage_response(
+            serde_json::from_value(json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 24.5,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1_800_000_000
+                    },
+                    "secondary_window": {
+                        "used_percent": 61.0,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1_800_600_000
+                    }
+                },
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": "12.50"
+                }
+            }))
+            .expect("usage response"),
+        );
+        assert_eq!(quota.plan.as_deref(), Some("plus"));
+        assert_eq!(quota.windows.len(), 2);
+        assert_eq!(quota.windows[0].name, "5 小时");
+        assert_eq!(quota.windows[1].name, "7 天");
+        assert_eq!(quota.credits.unwrap().balance.as_deref(), Some("12.50"));
+    }
+
+    #[test]
+    fn rejected_access_token_refreshes_once_before_returning_quota() {
+        let usage_server = Server::http("127.0.0.1:0").expect("bind usage server");
+        let usage_url = format!(
+            "http://{}/usage",
+            usage_server.server_addr().to_ip().expect("usage address")
+        );
+        let usage_task = thread::spawn(move || {
+            let first = usage_server.recv().expect("first usage request");
+            first
+                .respond(Response::empty(TinyStatusCode(401)))
+                .expect("reject old access token");
+            let second = usage_server.recv().expect("second usage request");
+            second
+                .respond(
+                    Response::from_string(
+                        json!({"rate_limit":{"primary_window":{"used_percent":7.0,"limit_window_seconds":18000,"reset_at":1800000000}}}).to_string(),
+                    )
+                    .with_header(
+                        "Content-Type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .expect("content type"),
+                    ),
+                )
+                .expect("return quota");
+        });
+        let refreshed_access = access_jwt(Utc::now().timestamp() + 3600);
+        let (token_url, token_task) = mock_token_server(
+            200,
+            json!({
+                "access_token": refreshed_access,
+                "refresh_token": "rotated-refresh",
+                "id_token": jwt("workspace")
+            }),
+        );
+        let client = Client::builder().no_proxy().build().unwrap();
+        let auth = serde_json::to_vec(&json!({
+            "tokens": {
+                "account_id": "workspace",
+                "access_token": access_jwt(Utc::now().timestamp() + 3600),
+                "refresh_token": "old-refresh",
+                "id_token": jwt("workspace")
+            }
+        }))
+        .unwrap();
+        let result = check_official_usage_with(&client, &usage_url, &token_url, &auth);
+        match result {
+            OfficialUsageCheck::Valid { auth, quota } => {
+                let document: Value = serde_json::from_slice(&auth).unwrap();
+                assert_eq!(
+                    token_field(&document, "refresh_token").as_deref(),
+                    Some("rotated-refresh")
+                );
+                assert_eq!(quota.windows[0].used_percent, 7.0);
+            }
+            other => panic!("unexpected usage result: {other:?}"),
+        }
+        assert_eq!(
+            token_task
+                .join()
+                .unwrap()
+                .get("refresh_token")
+                .map(String::as_str),
+            Some("old-refresh")
+        );
+        usage_task.join().unwrap();
+    }
+
+    #[test]
+    fn permanent_refresh_failure_requires_login_but_server_errors_do_not() {
+        let auth = serde_json::to_vec(&json!({
+            "tokens": {
+                "access_token": access_jwt(Utc::now().timestamp() + 30),
+                "refresh_token": "old-refresh"
+            }
+        }))
+        .unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        let (invalid_url, invalid_task) = mock_token_server(400, json!({"error":"invalid_grant"}));
+        assert_eq!(
+            check_official_usage_with(&client, "http://127.0.0.1:9/usage", &invalid_url, &auth),
+            OfficialUsageCheck::ReauthRequired
+        );
+        invalid_task.join().unwrap();
+
+        let (forbidden_url, forbidden_task) = mock_token_server(403, json!({}));
+        assert_eq!(
+            check_official_usage_with(&client, "http://127.0.0.1:9/usage", &forbidden_url, &auth,),
+            OfficialUsageCheck::ReauthRequired
+        );
+        forbidden_task.join().unwrap();
+
+        let (temporary_url, temporary_task) =
+            mock_token_server(503, json!({"error":"temporarily_unavailable"}));
+        let result =
+            check_official_usage_with(&client, "http://127.0.0.1:9/usage", &temporary_url, &auth);
+        assert!(matches!(result, OfficialUsageCheck::Unavailable(_)));
+        temporary_task.join().unwrap();
     }
 }
 

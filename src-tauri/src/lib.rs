@@ -12,6 +12,7 @@ mod profiles;
 mod progress;
 mod provider_import;
 mod provider_sync;
+mod provider_usage;
 mod sse;
 mod tray;
 mod upstream;

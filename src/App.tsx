@@ -1,25 +1,30 @@
 import {
+  AlertCircle,
   Check,
   CircleUserRound,
+  Clock,
   Info,
   LoaderCircle,
   LogIn,
   Plus,
   KeyRound,
+  RefreshCw,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "./components/ConfirmDialog";
-import { ProviderCard } from "./components/ProviderCard";
+import { ProviderCard, type ProviderUsageView } from "./components/ProviderCard";
 import { ProviderDialog } from "./components/ProviderDialog";
 import { cswitchApi } from "./lib/api";
 import type {
   OfficialAccountSummary,
+  OfficialAccountUsage,
   OperationProgress,
   ProviderDraft,
   ProviderState,
   ProviderSummary,
   ProviderSyncReport,
+  ProviderUsage,
   SavedProvider,
 } from "./types";
 
@@ -35,6 +40,148 @@ const EMPTY_STATE: ProviderState = {
 
 type Notice = { kind: "success" | "error"; text: string } | null;
 type BusyAction = "load" | "official" | "save" | "route" | "delete" | "keep-auth" | string | null;
+type OfficialUsageView = { checking: boolean; data: OfficialAccountUsage | null };
+
+function unavailableUsage(accountId: string, message: string): OfficialAccountUsage {
+  return {
+    accountId,
+    health: "unknown",
+    plan: null,
+    windows: [],
+    credits: null,
+    message,
+    queriedAt: Date.now(),
+  };
+}
+
+function unavailableProviderUsage(providerId: string, message: string): ProviderUsage {
+  return {
+    providerId,
+    status: "unknown",
+    system: null,
+    balance: null,
+    total: null,
+    used: null,
+    unit: null,
+    unlimited: false,
+    plan: null,
+    message,
+    queriedAt: Date.now(),
+  };
+}
+
+function resetLabel(resetAt: number | null): string | null {
+  if (!resetAt) return null;
+  const remaining = resetAt * 1000 - Date.now();
+  if (remaining <= 0) return "即将重置";
+  const minutes = Math.ceil(remaining / 60_000);
+  if (minutes < 60) return `${minutes} 分钟后重置`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 48) return `${hours} 小时后重置`;
+  return `${Math.ceil(hours / 24)} 天后重置`;
+}
+
+function planLabel(plan: string | null): string | null {
+  if (!plan) return null;
+  const names: Record<string, string> = {
+    free: "Free",
+    plus: "Plus",
+    pro: "Pro",
+    team: "Team",
+    business: "Business",
+    enterprise: "Enterprise",
+  };
+  return names[plan.toLowerCase()] ?? plan;
+}
+
+function OfficialUsagePanel({
+  account,
+  usage,
+  disabled,
+  onRefresh,
+  onReauth,
+}: {
+  account: OfficialAccountSummary;
+  usage: OfficialUsageView | undefined;
+  disabled: boolean;
+  onRefresh: () => void;
+  onReauth: () => void;
+}) {
+  if (!usage || (usage.checking && !usage.data)) {
+    return (
+      <div className="account-status checking" aria-live="polite">
+        <LoaderCircle className="spinner" size={13} />
+        <span>正在查询额度</span>
+      </div>
+    );
+  }
+  const data = usage.data;
+  if (!data) return null;
+  if (data.health === "reauth_required") {
+    return (
+      <button className="account-status expired" type="button" disabled={disabled} onClick={onReauth}>
+        <AlertCircle size={14} />
+        <span><strong>登录已失效</strong>　点击重新登录此账号</span>
+      </button>
+    );
+  }
+  if (data.health === "unknown") {
+    return (
+      <div className="account-status unavailable" title={data.message ?? undefined}>
+        <AlertCircle size={14} />
+        <span>{data.message ?? "额度暂时无法查询"}</span>
+        <button className="quota-refresh" type="button" disabled={disabled || usage.checking}
+          aria-label={`重新查询 ${account.label} 的额度`} onClick={onRefresh}>
+          <RefreshCw className={usage.checking ? "spinner" : ""} size={13} />
+        </button>
+      </div>
+    );
+  }
+  const credits = data.credits;
+  const creditText = credits?.unlimited
+    ? "额外额度不限量"
+    : credits?.balance != null
+      ? `余额 ${credits.balance}`
+      : credits?.hasCredits ? "额外额度可用" : null;
+  return (
+    <div className="account-quota">
+      <div className="quota-heading">
+        <span>{planLabel(data.plan) ?? "官方额度"}{creditText ? ` · ${creditText}` : ""}</span>
+        <button className="quota-refresh" type="button" disabled={disabled || usage.checking}
+          aria-label={`刷新 ${account.label} 的额度`} onClick={onRefresh}>
+          <RefreshCw className={usage.checking ? "spinner" : ""} size={13} />
+        </button>
+      </div>
+      {data.windows.length > 0 ? (
+        <div className="quota-windows">
+          {data.windows.map((window, index) => {
+            const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
+            const reset = resetLabel(window.resetAt);
+            return (
+              <div className="quota-window" key={`${window.name}-${window.windowSeconds ?? index}`}
+                title={window.resetAt ? new Date(window.resetAt * 1000).toLocaleString() : undefined}>
+                <div className="quota-line">
+                  <span>{window.name}</span>
+                  <strong className={remaining <= 10 ? "low" : remaining <= 30 ? "medium" : ""}>
+                    {Math.round(remaining)}% 可用
+                  </strong>
+                </div>
+                <div className="quota-track" aria-hidden="true">
+                  <span className={remaining <= 10 ? "low" : remaining <= 30 ? "medium" : ""}
+                    style={{ width: `${remaining}%` }} />
+                </div>
+                {reset && <span className="quota-reset"><Clock size={10} />{reset}</span>}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <span className="quota-empty">官方接口未返回限额窗口</span>
+      )}
+      {data.message && <span className="quota-message">{data.message}</span>}
+    </div>
+  );
+}
 
 function errorText(error: unknown): string {
   if (typeof error === "string") return error;
@@ -58,10 +205,20 @@ function App() {
   const [routingProvider, setRoutingProvider] = useState<ProviderSummary | null>(null);
   const [deletingProvider, setDeletingProvider] = useState<ProviderSummary | null>(null);
   const [progress, setProgress] = useState<OperationProgress | null>(null);
+  const [officialUsage, setOfficialUsage] = useState<Record<string, OfficialUsageView>>({});
+  const [providerUsage, setProviderUsage] = useState<Record<string, ProviderUsageView>>({});
+  const [usageEpoch, setUsageEpoch] = useState(0);
+  const [providerUsageEpoch, setProviderUsageEpoch] = useState(0);
   const noticeTimer = useRef<number | null>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const officialCancelled = useRef(false);
   const inFlight = useRef(false);
+  const usageGeneration = useRef(0);
+  const usageRequestVersions = useRef<Record<string, number>>({});
+  const lastUsageCheck = useRef(0);
+  const providerUsageGeneration = useRef(0);
+  const providerUsageRequestVersions = useRef<Record<string, number>>({});
+  const lastProviderUsageCheck = useRef(0);
   const beginAction = () => {
     if (inFlight.current || busy || progress) return false;
     inFlight.current = true;
@@ -82,6 +239,73 @@ function App() {
   const refresh = useCallback(async () => {
     setState(await cswitchApi.listProviders());
   }, []);
+
+  const queryOfficialUsage = useCallback(async (accountId: string) => {
+    const requestVersion = (usageRequestVersions.current[accountId] ?? 0) + 1;
+    usageRequestVersions.current[accountId] = requestVersion;
+    setOfficialUsage((current) => ({
+      ...current,
+      [accountId]: { checking: true, data: current[accountId]?.data ?? null },
+    }));
+    try {
+      const data = await cswitchApi.queryOfficialAccountUsage(accountId);
+      if (usageRequestVersions.current[accountId] !== requestVersion) return;
+      setOfficialUsage((current) => ({ ...current, [accountId]: { checking: false, data } }));
+    } catch (error) {
+      if (usageRequestVersions.current[accountId] !== requestVersion) return;
+      setOfficialUsage((current) => ({
+        ...current,
+        [accountId]: {
+          checking: false,
+          data: unavailableUsage(accountId, errorText(error)),
+        },
+      }));
+    }
+  }, []);
+
+  const queryProviderBalance = useCallback(async (providerId: string) => {
+    const requestVersion = (providerUsageRequestVersions.current[providerId] ?? 0) + 1;
+    providerUsageRequestVersions.current[providerId] = requestVersion;
+    setProviderUsage((current) => ({
+      ...current,
+      [providerId]: { checking: true, data: current[providerId]?.data ?? null },
+    }));
+    try {
+      const data = await cswitchApi.queryProviderUsage(providerId);
+      if (providerUsageRequestVersions.current[providerId] !== requestVersion) return;
+      setProviderUsage((current) => ({
+        ...current,
+        [providerId]: { checking: false, data },
+      }));
+    } catch (error) {
+      if (providerUsageRequestVersions.current[providerId] !== requestVersion) return;
+      setProviderUsage((current) => ({
+        ...current,
+        [providerId]: {
+          checking: false,
+          data: unavailableProviderUsage(providerId, errorText(error)),
+        },
+      }));
+    }
+  }, []);
+
+  const isLoading = busy === "load";
+  const locked = Boolean(busy) || Boolean(progress);
+  const hasDialog = providerDialogOpen || Boolean(routingProvider) || Boolean(deletingProvider) || Boolean(progress);
+  const officialAccountKey = state.officialAccounts.map((account) => account.id).join(",");
+  const providerUsageKey = state.providers
+    .map((provider) => `${provider.id}:${provider.apiUrl}:${provider.hasApiKey}`)
+    .join(",");
+
+  const refreshAccountUsage = useCallback((accountId: string) => {
+    lastUsageCheck.current = Date.now();
+    void queryOfficialUsage(accountId);
+  }, [queryOfficialUsage]);
+
+  const refreshProviderUsage = useCallback((providerId: string) => {
+    lastProviderUsageCheck.current = Date.now();
+    void queryProviderBalance(providerId);
+  }, [queryProviderBalance]);
 
   useEffect(() => {
     if (state.warnings.length) showNotice("error", state.warnings.join("\n"));
@@ -144,6 +368,69 @@ function App() {
     };
   }, [refresh, showNotice]);
 
+  useEffect(() => {
+    if (isLoading) return;
+    const accounts = state.officialAccounts;
+    const accountIds = new Set(accounts.map((account) => account.id));
+    for (const id of Object.keys(usageRequestVersions.current)) {
+      if (!accountIds.has(id)) delete usageRequestVersions.current[id];
+    }
+    setOfficialUsage((current) => Object.fromEntries(
+      Object.entries(current).filter(([id]) => accountIds.has(id)),
+    ));
+    if (accounts.length === 0) return;
+    const generation = ++usageGeneration.current;
+    lastUsageCheck.current = Date.now();
+    void (async () => {
+      for (const account of accounts) {
+        if (usageGeneration.current !== generation) return;
+        await queryOfficialUsage(account.id);
+      }
+    })();
+    return () => {
+      if (usageGeneration.current === generation) usageGeneration.current += 1;
+    };
+  }, [isLoading, officialAccountKey, queryOfficialUsage, usageEpoch]);
+
+  useEffect(() => {
+    if (isLoading) return;
+    const providers = state.providers.filter((provider) => provider.hasApiKey);
+    const providerIds = new Set(providers.map((provider) => provider.id));
+    for (const id of Object.keys(providerUsageRequestVersions.current)) {
+      if (!providerIds.has(id)) delete providerUsageRequestVersions.current[id];
+    }
+    setProviderUsage((current) => Object.fromEntries(
+      Object.entries(current).filter(([id]) => providerIds.has(id)),
+    ));
+    if (providers.length === 0) return;
+    const generation = ++providerUsageGeneration.current;
+    lastProviderUsageCheck.current = Date.now();
+    void (async () => {
+      for (const provider of providers) {
+        if (providerUsageGeneration.current !== generation) return;
+        await queryProviderBalance(provider.id);
+      }
+    })();
+    return () => {
+      if (providerUsageGeneration.current === generation) {
+        providerUsageGeneration.current += 1;
+      }
+    };
+  }, [isLoading, providerUsageEpoch, providerUsageKey, queryProviderBalance]);
+
+  useEffect(() => {
+    const onFocus = () => {
+      if (Date.now() - lastUsageCheck.current >= 5 * 60_000) {
+        setUsageEpoch((value) => value + 1);
+      }
+      if (Date.now() - lastProviderUsageCheck.current >= 5 * 60_000) {
+        setProviderUsageEpoch((value) => value + 1);
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
   const openAdd = () => {
     setAddMenuOpen(false);
     setEditingProvider(null);
@@ -202,6 +489,7 @@ function App() {
       setProviderDialogOpen(false);
       setEditingProvider(null);
       await refresh();
+      setProviderUsageEpoch((value) => value + 1);
       if (result.routingRequired) {
         setRoutingProvider(result.provider);
         showNotice("success", "供应商已保存");
@@ -288,9 +576,11 @@ function App() {
     setBusy("official");
     setProgress({
       operation: "official",
-      title: adding ? "添加官方账号" : `切换到 ${account?.label ?? "官方登录"}`,
+      title: adding ? account ? `重新登录 ${account.label}` : "添加官方账号" : `切换到 ${account?.label ?? "官方登录"}`,
       stage: adding ? "准备登录" : "准备切换",
-      detail: adding ? "请在浏览器登录要添加的账号，当前线路保持不变。" : "正在检查选中的官方账号。",
+      detail: adding
+        ? account ? "请在浏览器登录这个账号；相同账号会原位更新，当前线路保持不变。" : "请在浏览器登录要添加的账号，当前线路保持不变。"
+        : "正在检查选中的官方账号。",
       current: 0,
       total: 7,
       done: false,
@@ -300,8 +590,9 @@ function App() {
         : account ? await cswitchApi.activateOfficialAccount(account.id)
         : await cswitchApi.startOfficialLogin();
       await refresh();
+      setUsageEpoch((value) => value + 1);
       if (officialCancelled.current) showNotice("success", "操作已经完成，取消请求到达时已提交");
-      else if (adding) showNotice("success", "账号已保存；重复登录会更新同一账号，点击卡片切换");
+      else if (adding) showNotice("success", account ? "账号登录已更新" : "账号已保存；重复登录会更新同一账号，点击卡片切换");
       else reportSuccess(account?.label ?? "官方登录", report);
     } catch (error) {
       const message = errorText(error);
@@ -365,10 +656,6 @@ function App() {
     };
   }, [addMenuOpen]);
 
-  const isLoading = busy === "load";
-  const locked = Boolean(busy) || Boolean(progress);
-  const hasDialog = providerDialogOpen || Boolean(routingProvider) || Boolean(deletingProvider) || Boolean(progress);
-
   useEffect(() => {
     if (isLoading) return;
     const frame = window.requestAnimationFrame(() => {
@@ -387,7 +674,7 @@ function App() {
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [isLoading, state.providers.length, state.officialAccounts.length, hasDialog, showNotice]);
+  }, [isLoading, state.providers.length, state.officialAccounts.length, officialUsage, providerUsage, hasDialog, showNotice]);
 
   const percent = progress && progress.total > 0
     ? Math.min(100, Math.round((progress.current / progress.total) * 100))
@@ -462,22 +749,36 @@ function App() {
 
       <main>
         <section className="provider-list" aria-label="官方账号列表">
-          {state.officialAccounts.map((account) => (
-            <article key={account.id} className={`provider-card official-card${account.active ? " active" : ""}`}>
-              <button className="provider-select" type="button" disabled={locked} onClick={() => void useOfficial(account)}
-                aria-label={`切换到官方账号 ${account.label} ${account.workspace}`}>
-                <span className="provider-icon official-icon" aria-hidden="true"><CircleUserRound size={20} /></span>
-                <span className="provider-copy">
-                  <span className="provider-title-row"><strong title={account.label}>{account.label}</strong>
-                    {account.active && <span className="active-badge"><Check size={12} />当前</span>}
+          {state.officialAccounts.map((account) => {
+            const usage = officialUsage[account.id];
+            const reauthRequired = usage?.data?.health === "reauth_required";
+            return (
+              <article key={account.id} className={`provider-card official-card${account.active ? " active" : ""}`}>
+                <button className="provider-select" type="button" disabled={locked}
+                  onClick={() => void useOfficial(account, reauthRequired)}
+                  aria-label={reauthRequired
+                    ? `重新登录官方账号 ${account.label} ${account.workspace}`
+                    : `切换到官方账号 ${account.label} ${account.workspace}`}>
+                  <span className="provider-icon official-icon" aria-hidden="true"><CircleUserRound size={20} /></span>
+                  <span className="provider-copy">
+                    <span className="provider-title-row"><strong title={account.label}>{account.label}</strong>
+                      {account.active && <span className="active-badge"><Check size={12} />当前</span>}
+                    </span>
+                    <span className="provider-meta"><span title={account.workspace}>ChatGPT · {account.workspace.slice(0, 8)}{!account.active && account.loginRetained ? " · 登录已保留" : ""}</span>
+                    </span>
                   </span>
-                  <span className="provider-meta"><span title={account.workspace}>ChatGPT · {account.workspace.slice(0, 8)}{!account.active && account.loginRetained ? " · 登录已保留" : ""}</span>
-                  </span>
-                </span>
-                <LogIn size={18} />
-              </button>
-            </article>
-          ))}
+                  {busy === "official" ? <LoaderCircle className="spinner" size={18} /> : <LogIn size={18} />}
+                </button>
+                <OfficialUsagePanel
+                  account={account}
+                  usage={usage}
+                  disabled={locked}
+                  onRefresh={() => refreshAccountUsage(account.id)}
+                  onReauth={() => void useOfficial(account, true)}
+                />
+              </article>
+            );
+          })}
           {state.officialAccounts.length === 0 && <article className={`provider-card official-card${state.officialActive ? " active" : ""}`}>
             <button className="provider-select" type="button" disabled={locked} onClick={() => void useOfficial()}>
               <span className="provider-icon official-icon" aria-hidden="true">
@@ -515,11 +816,13 @@ function App() {
             <ProviderCard
               key={provider.id}
               provider={provider}
+              usage={providerUsage[provider.id]}
               disabled={locked}
               activating={busy === provider.id}
               onActivate={() => void activate(provider)}
               onEdit={() => openEdit(provider)}
               onRefreshModels={() => void refreshModels(provider)}
+              onRefreshUsage={() => refreshProviderUsage(provider.id)}
               onDelete={() => setDeletingProvider(provider)}
               onEnableRouting={() => setRoutingProvider(provider)}
             />

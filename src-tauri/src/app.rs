@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::{
     codex_process, config, gateway, model_catalog, oauth, profiles, progress, provider_import,
-    provider_sync, upstream,
+    provider_sync, provider_usage, upstream,
 };
 #[cfg(test)]
 use config::build_provider_config;
@@ -43,6 +43,69 @@ pub(crate) struct ProviderState {
     pub(crate) official_active: bool,
     pub(crate) keep_official_auth: bool,
     pub(crate) official_auth_available: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OfficialAccountHealth {
+    Valid,
+    ReauthRequired,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OfficialAccountUsage {
+    pub(crate) account_id: String,
+    pub(crate) health: OfficialAccountHealth,
+    pub(crate) plan: Option<String>,
+    pub(crate) windows: Vec<oauth::OfficialQuotaWindow>,
+    pub(crate) credits: Option<oauth::OfficialCredits>,
+    pub(crate) message: Option<String>,
+    pub(crate) queried_at: i64,
+}
+
+pub(crate) enum OfficialAccountUsageProbe {
+    Ready(OfficialAccountUsage),
+    NeedsExclusiveRefresh,
+}
+
+impl OfficialAccountUsage {
+    pub(crate) fn unavailable(account_id: &str, message: impl Into<String>) -> Self {
+        Self {
+            account_id: account_id.to_string(),
+            health: OfficialAccountHealth::Unknown,
+            plan: None,
+            windows: Vec::new(),
+            credits: None,
+            message: Some(message.into()),
+            queried_at: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    fn reauth_required(account_id: &str) -> Self {
+        Self {
+            account_id: account_id.to_string(),
+            health: OfficialAccountHealth::ReauthRequired,
+            plan: None,
+            windows: Vec::new(),
+            credits: None,
+            message: Some("官方登录已失效，请重新登录此账号".into()),
+            queried_at: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    fn valid(account_id: &str, quota: oauth::OfficialQuota, message: Option<String>) -> Self {
+        Self {
+            account_id: account_id.to_string(),
+            health: OfficialAccountHealth::Valid,
+            plan: quota.plan,
+            windows: quota.windows,
+            credits: quota.credits,
+            message,
+            queried_at: chrono::Utc::now().timestamp_millis(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +210,96 @@ pub(crate) fn list_provider_state_read_only(
         keep_official_auth: profiles.keep_official_auth()?,
         official_auth_available: official_credential_available(codex_home, &profiles)?,
     })
+}
+
+pub(crate) fn probe_official_account_usage(
+    codex_home: &Path,
+    account_id: &str,
+    allow_refresh: bool,
+) -> Result<OfficialAccountUsageProbe, Box<dyn Error>> {
+    if allow_refresh {
+        sync_official_accounts(codex_home)?;
+    }
+    let accounts = crate::official_accounts::Store::new(codex_home);
+    let account = accounts.load(account_id)?;
+    let candidate = serde_json::to_vec_pretty(&account.auth)?;
+
+    if !allow_refresh {
+        return Ok(match oauth::inspect_auth(&candidate) {
+            LocalAuthState::Invalid => {
+                OfficialAccountUsageProbe::Ready(OfficialAccountUsage::reauth_required(account_id))
+            }
+            LocalAuthState::NeedsRefresh => OfficialAccountUsageProbe::NeedsExclusiveRefresh,
+            LocalAuthState::Current => match oauth::fetch_official_usage(&candidate) {
+                oauth::OfficialUsageFetch::Available(quota) => OfficialAccountUsageProbe::Ready(
+                    OfficialAccountUsage::valid(account_id, quota, None),
+                ),
+                oauth::OfficialUsageFetch::Rejected => {
+                    OfficialAccountUsageProbe::NeedsExclusiveRefresh
+                }
+                oauth::OfficialUsageFetch::Unavailable(message) => {
+                    OfficialAccountUsageProbe::Ready(OfficialAccountUsage::unavailable(
+                        account_id, message,
+                    ))
+                }
+            },
+        });
+    }
+
+    let live_before = read_optional_file(&codex_home.join("auth.json"))?;
+    let live_is_selected = live_before
+        .as_deref()
+        .and_then(crate::official_accounts::identity)
+        .as_ref()
+        == Some(&account.identity);
+    let result = match oauth::check_official_usage(&candidate) {
+        oauth::OfficialUsageCheck::ReauthRequired => {
+            OfficialAccountUsage::reauth_required(account_id)
+        }
+        oauth::OfficialUsageCheck::Unavailable(message) => {
+            OfficialAccountUsage::unavailable(account_id, message)
+        }
+        oauth::OfficialUsageCheck::Valid { auth, quota } => {
+            if crate::official_accounts::identity(&auth).as_ref() != Some(&account.identity) {
+                return Err("刷新后的认证身份与选中账号不一致，已停止写入".into());
+            }
+            let mut message = None;
+            if auth != candidate {
+                accounts.save(&auth)?;
+                if live_is_selected {
+                    if read_optional_file(&codex_home.join("auth.json"))? == live_before {
+                        match profiles::atomic_write_private(&codex_home.join("auth.json"), &auth) {
+                            Ok(()) => accounts.mark_live(&auth)?,
+                            Err(error) => {
+                                message = Some(format!(
+                                    "额度已读取，新凭据已保存；同步当前 auth.json 失败：{error}"
+                                ));
+                            }
+                        }
+                    } else {
+                        message = Some(
+                            "额度已读取；查询期间当前 auth.json 已更新，未用旧结果覆盖".into(),
+                        );
+                    }
+                }
+            }
+            OfficialAccountUsage::valid(account_id, quota, message)
+        }
+    };
+    Ok(OfficialAccountUsageProbe::Ready(result))
+}
+
+pub(crate) fn query_provider_usage(
+    codex_home: &Path,
+    provider_id: &str,
+) -> Result<provider_usage::ProviderUsage, Box<dyn Error>> {
+    let profile = ProfileStore::new(codex_home).load_provider(provider_id)?;
+    let api_key = api_key_from_auth(&profile.auth)?.ok_or("供应商缺少 API Key")?;
+    Ok(provider_usage::query(
+        provider_id,
+        &profile.record.api_url,
+        &api_key,
+    ))
 }
 
 pub(crate) fn save_provider_inner(
@@ -1226,7 +1379,10 @@ where
     for candidate in candidates {
         let health = match oauth::inspect_auth(candidate) {
             LocalAuthState::Invalid => continue,
-            LocalAuthState::Current => validate(candidate)?,
+            LocalAuthState::Current => match validate(candidate)? {
+                AuthHealth::Valid(auth) => AuthHealth::Valid(auth),
+                AuthHealth::Invalid => refresh(candidate)?,
+            },
             LocalAuthState::NeedsRefresh => refresh(candidate)?,
         };
         match health {
