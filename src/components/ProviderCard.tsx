@@ -10,12 +10,6 @@ import {
 } from "lucide-react";
 import type { ProviderSummary, ProviderUsage } from "../types";
 
-const protocolLabels: Record<string, string> = {
-  openai_responses: "Responses",
-  openai_chat: "Chat Completions",
-  anthropic_messages: "Anthropic Messages",
-};
-
 interface ProviderCardProps {
   provider: ProviderSummary;
   usage: ProviderUsageView | undefined;
@@ -41,6 +35,25 @@ function amount(value: number, unit: string | null): string {
     maximumFractionDigits: digits,
   });
   return unit === "USD" ? `$${formatted}` : `${formatted}${unit ? ` ${unit}` : ""}`;
+}
+
+function providerHost(apiUrl: string): string {
+  try {
+    return new URL(apiUrl).host;
+  } catch {
+    return apiUrl.replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
+  }
+}
+
+function balanceText(usage: ProviderUsageView | undefined): string | null {
+  const data = usage?.data;
+  if (!data || data.status !== "available") return null;
+  if (data.unlimited) return "不限额";
+  if (data.balance != null) return amount(data.balance, data.unit);
+  if (data.total != null && data.used != null) {
+    return amount(Math.max(0, data.total - data.used), data.unit);
+  }
+  return null;
 }
 
 function ProviderUsagePanel({
@@ -87,34 +100,7 @@ function ProviderUsagePanel({
     );
   }
 
-  const title = [data.system, data.plan].filter(Boolean).join(" · ");
-  const primary = data.unlimited
-    ? "不限额度"
-    : data.balance != null
-      ? amount(data.balance, data.unit)
-      : "余额接口已连接";
-  const detail = data.total != null && data.used != null
-    ? `总额 ${amount(data.total, data.unit)} · 已用 ${amount(data.used, data.unit)}`
-    : data.message;
-
-  return (
-    <div className="provider-balance">
-      <span className="provider-balance-name" title={title}>{title}</span>
-      <span className="provider-balance-value">
-        <strong>{primary}</strong>
-        {detail && <small>{detail}</small>}
-      </span>
-      <button
-        className="quota-refresh"
-        type="button"
-        disabled={disabled || usage.checking}
-        aria-label={`刷新 ${provider.name} 的余额`}
-        onClick={onRefresh}
-      >
-        <RefreshCw className={usage.checking ? "spinner" : ""} size={13} />
-      </button>
-    </div>
-  );
+  return null;
 }
 
 export function ProviderCard({
@@ -131,7 +117,8 @@ export function ProviderCard({
 }: ProviderCardProps) {
   const needsRouting =
     provider.protocol !== "openai_responses" && provider.routingMode !== "local";
-  const protocol = protocolLabels[provider.protocol] ?? provider.protocol;
+  const balance = balanceText(usage);
+  const displayName = `${provider.name} (${providerHost(provider.apiUrl)})`;
 
   return (
     <article className={`provider-card${provider.active ? " active" : ""}`}>
@@ -147,19 +134,16 @@ export function ProviderCard({
         </span>
         <span className="provider-copy">
           <span className="provider-title-row">
-            <strong>{provider.name}</strong>
+            <strong title={`${provider.name} · ${provider.apiUrl}`}>{displayName}</strong>
+            {balance && <span className="provider-inline-balance">{balance}</span>}
             {provider.active && (
               <span className="active-badge">
                 <Check size={12} /> 当前
               </span>
             )}
           </span>
-          <span className="provider-meta" title={provider.apiUrl}>
-            <span>{provider.apiUrl}</span>
-            <span aria-hidden="true">·</span>
+          <span className="provider-meta">
             <span>{provider.modelCount} 个模型</span>
-            <span aria-hidden="true">·</span>
-            <span>{protocol}</span>
           </span>
         </span>
         {activating && <LoaderCircle className="spinner" size={18} aria-label="处理中" />}

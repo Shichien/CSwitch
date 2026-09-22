@@ -135,7 +135,7 @@ fn probe_sub2api(client: &Client, endpoint: &str, api_key: &str) -> ProbeResult 
         };
     }
     if response.status.as_u16() == 429 || response.status.is_server_error() {
-        return ProbeResult::Unknown("SUB2API 余额接口暂时不可用");
+        return ProbeResult::Unknown("余额接口暂时不可用");
     }
     if !response.status.is_success() {
         return ProbeResult::Unsupported;
@@ -162,7 +162,7 @@ fn probe_new_api(client: &Client, endpoint: &str, api_key: &str) -> ProbeResult 
         };
     }
     if response.status.as_u16() == 429 || response.status.is_server_error() {
-        return ProbeResult::Unknown("NewAPI 余额接口暂时不可用");
+        return ProbeResult::Unknown("余额接口暂时不可用");
     }
     if !response.status.is_success() {
         return ProbeResult::Unsupported;

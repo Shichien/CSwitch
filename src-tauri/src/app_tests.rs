@@ -292,6 +292,76 @@ fn stores_multiple_providers_with_independent_credentials_and_catalogs() {
 }
 
 #[test]
+fn refreshing_models_uses_saved_protocol_and_only_updates_the_catalog() {
+    use std::thread;
+    use tiny_http::{Header, Response, Server};
+
+    let directory = tempdir().expect("tempdir");
+    let codex_home = directory.path();
+    let live_config = b"model = 'live-model'\napproval_policy = 'never'\n";
+    let live_auth = b"{\"OPENAI_API_KEY\":\"live-key\"}";
+    fs::write(codex_home.join("config.toml"), live_config).expect("write live config");
+    fs::write(codex_home.join("auth.json"), live_auth).expect("write live auth");
+
+    let server = Server::http("127.0.0.1:0").expect("server");
+    let api_url = format!("http://{}", server.server_addr());
+    let provider = save_fixture_provider(
+        codex_home,
+        "模型刷新测试",
+        &api_url,
+        "saved-provider-key",
+        &["old-model"],
+    );
+    let profiles = ProfileStore::new(codex_home);
+    let before = profiles.load_provider(&provider.id).expect("load before");
+
+    let task = thread::spawn(move || {
+        let request = server.recv().expect("models request");
+        assert_eq!(request.method().as_str(), "GET");
+        assert_eq!(request.url(), "/v1/models");
+        let authorization = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Authorization"))
+            .expect("authorization header");
+        assert_eq!(authorization.value.as_str(), "Bearer saved-provider-key");
+        request
+            .respond(
+                Response::from_string(r#"{"data":[{"id":"new-model"},{"id":"second-model"}]}"#)
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type"),
+                    ),
+            )
+            .expect("models response");
+    });
+
+    let state = refresh_provider_models_inner(codex_home, &provider.id).expect("refresh models");
+    task.join().expect("models server");
+    let after = profiles.load_provider(&provider.id).expect("load after");
+
+    assert_eq!(state.providers[0].model_count, 2);
+    assert_eq!(
+        catalog_ids(after.catalog.as_deref().unwrap()),
+        ["new-model", "second-model"]
+    );
+    assert_eq!(after.auth, before.auth);
+    assert_eq!(after.config, before.config);
+    assert_eq!(after.record.protocol, before.record.protocol);
+    assert_eq!(after.record.routing_mode, before.record.routing_mode);
+    assert_eq!(
+        after.record.inference_endpoint,
+        before.record.inference_endpoint
+    );
+    assert_eq!(after.record.generation, before.record.generation);
+    assert_eq!(
+        fs::read(codex_home.join("config.toml")).unwrap(),
+        live_config
+    );
+    assert_eq!(fs::read(codex_home.join("auth.json")).unwrap(), live_auth);
+}
+
+#[test]
 fn official_active_marker_requires_an_official_credential() {
     let directory = tempdir().expect("tempdir");
     let codex_home = directory.path();

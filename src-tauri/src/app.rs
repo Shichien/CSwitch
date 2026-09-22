@@ -858,13 +858,13 @@ pub(crate) fn refresh_provider_models_inner(
 ) -> Result<ProviderState, Box<dyn Error>> {
     let profiles = ProfileStore::new(codex_home);
     let provider = profiles.load_provider(id)?;
-    save_provider_inner(
-        codex_home,
-        Some(id),
-        &provider.record.name,
+    let key = api_key_from_auth(&provider.auth)?.ok_or("供应商缺少 API Key")?;
+    let catalog = model_catalog::fetch_with_auth(
         &provider.record.api_url,
-        "",
+        &key,
+        provider.record.protocol == "anthropic_messages",
     )?;
+    profiles.update_provider_catalog(id, &catalog.bytes)?;
     list_provider_state(codex_home)
 }
 

@@ -2,8 +2,6 @@ import {
   AlertCircle,
   Check,
   CircleUserRound,
-  Clock,
-  Info,
   LoaderCircle,
   LogIn,
   Plus,
@@ -70,15 +68,18 @@ function unavailableProviderUsage(providerId: string, message: string): Provider
   };
 }
 
-function resetLabel(resetAt: number | null): string | null {
+function resetTimeLabel(resetAt: number | null): string | null {
   if (!resetAt) return null;
-  const remaining = resetAt * 1000 - Date.now();
-  if (remaining <= 0) return "即将重置";
-  const minutes = Math.ceil(remaining / 60_000);
-  if (minutes < 60) return `${minutes} 分钟后重置`;
-  const hours = Math.ceil(minutes / 60);
-  if (hours < 48) return `${hours} 小时后重置`;
-  return `${Math.ceil(hours / 24)} 天后重置`;
+  const date = new Date(resetAt * 1000);
+  if (Number.isNaN(date.getTime())) return null;
+  return `${new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date)} 重置`;
 }
 
 function planLabel(plan: string | null): string | null {
@@ -137,40 +138,32 @@ function OfficialUsagePanel({
       </div>
     );
   }
-  const credits = data.credits;
-  const creditText = credits?.unlimited
-    ? "额外额度不限量"
-    : credits?.balance != null
-      ? `余额 ${credits.balance}`
-      : credits?.hasCredits ? "额外额度可用" : null;
   return (
     <div className="account-quota">
-      <div className="quota-heading">
-        <span>{planLabel(data.plan) ?? "官方额度"}{creditText ? ` · ${creditText}` : ""}</span>
-        <button className="quota-refresh" type="button" disabled={disabled || usage.checking}
-          aria-label={`刷新 ${account.label} 的额度`} onClick={onRefresh}>
-          <RefreshCw className={usage.checking ? "spinner" : ""} size={13} />
-        </button>
-      </div>
+      <button className="quota-refresh account-quota-refresh" type="button"
+        disabled={disabled || usage.checking}
+        aria-label={`刷新 ${account.label} 的额度`} onClick={onRefresh}>
+        <RefreshCw className={usage.checking ? "spinner" : ""} size={13} />
+      </button>
       {data.windows.length > 0 ? (
         <div className="quota-windows">
           {data.windows.map((window, index) => {
             const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
-            const reset = resetLabel(window.resetAt);
+            const reset = resetTimeLabel(window.resetAt);
             return (
               <div className="quota-window" key={`${window.name}-${window.windowSeconds ?? index}`}
                 title={window.resetAt ? new Date(window.resetAt * 1000).toLocaleString() : undefined}>
                 <div className="quota-line">
                   <span>{window.name}</span>
                   <strong className={remaining <= 10 ? "low" : remaining <= 30 ? "medium" : ""}>
-                    {Math.round(remaining)}% 可用
+                    {Math.round(remaining)}%
                   </strong>
                 </div>
                 <div className="quota-track" aria-hidden="true">
                   <span className={remaining <= 10 ? "low" : remaining <= 30 ? "medium" : ""}
                     style={{ width: `${remaining}%` }} />
                 </div>
-                {reset && <span className="quota-reset"><Clock size={10} />{reset}</span>}
+                {reset && <span className="quota-reset">{reset}</span>}
               </div>
             );
           })}
@@ -613,8 +606,8 @@ function App() {
       showNotice(
         "success",
         enabled
-          ? "常驻路由已开启；首次启用请重新打开 Codex，后续切换线路直接生效"
-          : "已关闭本地路由，请重新打开 Codex 使用原请求地址",
+          ? "路由模式已开启；首次启用请重新打开 Codex，后续切换线路直接生效"
+          : "路由模式已关闭，请重新打开 Codex 使用原请求地址",
       );
     } catch (error) {
       showNotice("error", errorText(error));
@@ -705,30 +698,7 @@ function App() {
           >
             <span />
           </button>
-          <label id="resident-route-label" htmlFor="resident-route">常驻本地路由</label>
-          <details
-            className="route-help"
-            onBlur={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                event.currentTarget.open = false;
-                event.currentTarget.querySelector("summary")?.focus();
-              }
-            }}
-          >
-            <summary aria-label="路由说明" title="路由说明"><Info size={16} /></summary>
-            <div className="route-help-content">
-              <strong>切换第三方时保留官方登录</strong>
-              <p>
-                {state.keepOfficialAuth
-                  ? state.officialAuthAvailable ? "官方登录态已保留，请求使用当前供应商 API Key。" : "尚未保存官方登录，本次使用 API Key；完成官方登录后可保留。"
-                  : "当前是 API Key 直连，会写入 auth.json。开启后保留 ChatGPT 登录，请求改走 API Key。"}
-                {!state.officialAuthAvailable && " 建议先完成一次官方登录再开启。"}
-              </p>
-            </div>
-          </details>
+          <label id="resident-route-label" htmlFor="resident-route">路由模式</label>
         </div>
         <div ref={addMenuRef} className="add-menu" onBlur={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget)) setAddMenuOpen(false);
@@ -752,19 +722,26 @@ function App() {
           {state.officialAccounts.map((account) => {
             const usage = officialUsage[account.id];
             const reauthRequired = usage?.data?.health === "reauth_required";
+            const subscription = usage?.data?.health === "valid"
+              ? (planLabel(usage.data.plan) ?? "订阅信息未返回")
+              : usage?.checking
+                ? "正在查询订阅"
+                : reauthRequired
+                  ? "登录已失效"
+                  : "订阅信息暂不可用";
             return (
               <article key={account.id} className={`provider-card official-card${account.active ? " active" : ""}`}>
                 <button className="provider-select" type="button" disabled={locked}
                   onClick={() => void useOfficial(account, reauthRequired)}
                   aria-label={reauthRequired
-                    ? `重新登录官方账号 ${account.label} ${account.workspace}`
-                    : `切换到官方账号 ${account.label} ${account.workspace}`}>
+                    ? `重新登录官方账号 ${account.label}`
+                    : `切换到官方账号 ${account.label}`}>
                   <span className="provider-icon official-icon" aria-hidden="true"><CircleUserRound size={20} /></span>
                   <span className="provider-copy">
                     <span className="provider-title-row"><strong title={account.label}>{account.label}</strong>
                       {account.active && <span className="active-badge"><Check size={12} />当前</span>}
                     </span>
-                    <span className="provider-meta"><span title={account.workspace}>ChatGPT · {account.workspace.slice(0, 8)}{!account.active && account.loginRetained ? " · 登录已保留" : ""}</span>
+                    <span className="provider-meta"><span>{subscription}</span>
                     </span>
                   </span>
                   {busy === "official" ? <LoaderCircle className="spinner" size={18} /> : <LogIn size={18} />}
@@ -791,7 +768,7 @@ function App() {
                     <span className="active-badge"><Check size={12} /> 当前</span>
                   )}
                 </span>
-                <span className="provider-meta"><span>ChatGPT OAuth</span></span>
+                <span className="provider-meta"><span>尚未登录</span></span>
               </span>
               {busy === "official" ? <LoaderCircle className="spinner" size={18} /> : <LogIn size={18} />}
             </button>

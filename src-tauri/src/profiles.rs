@@ -408,6 +408,53 @@ impl ProfileStore {
         Ok(())
     }
 
+    pub fn update_provider_catalog(
+        &self,
+        id: &str,
+        catalog: &[u8],
+    ) -> Result<ProviderRecord, Box<dyn Error>> {
+        validate_provider_id(id)?;
+        let model_count = count_catalog_models(catalog)?;
+        let mut registry = self.load_registry()?;
+        let index = registry
+            .providers
+            .iter()
+            .position(|provider| provider.id == id)
+            .ok_or_else(|| format!("供应商不存在：{id}"))?;
+        let previous_record = registry.providers[index].clone();
+        let directory = self.record_dir(&previous_record)?;
+        let catalog_file = previous_record
+            .catalog_file
+            .clone()
+            .unwrap_or_else(|| "models-current.json".to_string());
+        validate_catalog_file(&catalog_file)?;
+        let path = directory.join(&catalog_file);
+        let previous_catalog = read_optional(&path)?;
+
+        atomic_write_private(&path, catalog)?;
+        verify_file(&path, catalog)?;
+
+        let mut updated = previous_record;
+        updated.catalog_file = Some(catalog_file);
+        updated.model_count = model_count;
+        updated.updated_at = Utc::now().to_rfc3339();
+        registry.providers[index] = updated.clone();
+        if let Err(error) = self.save_registry(&registry) {
+            let restored = match previous_catalog {
+                Some(previous) => atomic_write_private(&path, &previous)
+                    .and_then(|()| verify_file(&path, &previous)),
+                None => remove_optional_file(&path),
+            };
+            if let Err(restore) = restored {
+                return Err(
+                    format!("模型列表更新未提交：{error}；恢复原模型列表失败：{restore}").into(),
+                );
+            }
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
     pub fn update_provider_routing(
         &self,
         id: &str,
