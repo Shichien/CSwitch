@@ -290,14 +290,6 @@ pub(crate) fn capture_route_transport(
     provider: &str,
 ) -> Result<crate::profiles::RouteHttpTransport, Box<dyn Error>> {
     let doc = parse_config(content)?;
-    if provider == "openai"
-        && doc
-            .get("model_providers")
-            .and_then(Item::as_table_like)
-            .is_some_and(|providers| providers.contains_key(HTTP_ROUTE_PROVIDER_ID))
-    {
-        return Err("config.toml 已存在 cswitch_local 提供方，请先为该自定义提供方改名".into());
-    }
     Ok(crate::profiles::RouteHttpTransport {
         // Preserve the original selector's spelling and comments, including its absence.
         previous_model_provider: doc
@@ -410,6 +402,13 @@ pub(crate) fn with_http_route(
         return with_provider_websockets(&doc.to_string(), provider, Some(false));
     }
     let mut doc = parse_config(content)?;
+    if doc
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .is_some_and(|providers| providers.contains_key(HTTP_ROUTE_PROVIDER_ID))
+    {
+        return Err("config.toml 已存在 cswitch_local 提供方，请先为该自定义提供方改名".into());
+    }
     doc.remove("experimental_bearer_token");
     doc["model_provider"] = value(HTTP_ROUTE_PROVIDER_ID);
     if !doc.contains_key("model_providers") {
@@ -430,6 +429,13 @@ pub(crate) fn with_http_route(
     table["supports_websockets"] = value(false);
     table["supports_standalone_web_search"] = value(true);
     providers[HTTP_ROUTE_PROVIDER_ID] = Item::Table(table);
+    Ok(doc.to_string())
+}
+
+pub(crate) fn with_native_openai_route(content: &str, url: &str) -> Result<String, Box<dyn Error>> {
+    let mut doc = parse_config(content)?;
+    doc.remove("experimental_bearer_token");
+    doc["openai_base_url"] = value(url);
     Ok(doc.to_string())
 }
 
@@ -457,6 +463,32 @@ pub(crate) fn restore_route_config(
     content: &str,
     route: &crate::profiles::OfficialRoute,
 ) -> Result<String, Box<dyn Error>> {
+    if route.native_openai {
+        let restored = restore_auth_fields(
+            content,
+            "openai",
+            route
+                .http_transport
+                .as_ref()
+                .and_then(|transport| transport.previous_auth_fields.as_deref()),
+        )?;
+        let mut doc = parse_config(&restored)?;
+        if let Some(url) = &route.previous_base_url {
+            doc["openai_base_url"] = value(url.as_str());
+        } else {
+            doc.remove("openai_base_url");
+        }
+        if let Some(original) = route
+            .http_transport
+            .as_ref()
+            .and_then(|transport| transport.previous_model_provider.as_deref())
+        {
+            doc["model_provider"] = parse_config(original)?["model_provider"].clone();
+        } else {
+            doc.remove("model_provider");
+        }
+        return Ok(doc.to_string());
+    }
     let text = if (route.http_transport.is_some() && route.config_provider == "openai")
         || provider_base_url(content, &route.config_provider)? == route.previous_base_url
     {

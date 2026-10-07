@@ -554,6 +554,7 @@ pub(crate) fn verify_route_config(
         return Err("请求地址已被外部修改，已保留当前配置；请恢复原地址后再操作路由".into());
     }
     if route.http_transport.is_some()
+        && !route.native_openai
         && config::provider_websockets(text, route.active_config_provider())? != Some(false)
     {
         return Err(
@@ -561,10 +562,17 @@ pub(crate) fn verify_route_config(
                 .into(),
         );
     }
+    if route.native_openai && parse_config(text)?.contains_key("experimental_bearer_token") {
+        return Err(
+            "路由认证字段已被外部修改，已保留当前配置；请移除 experimental_bearer_token 后再操作"
+                .into(),
+        );
+    }
     if route
         .http_transport
         .as_ref()
         .is_some_and(|transport| transport.previous_auth_fields.is_some())
+        && !route.native_openai
         && !config::uses_managed_file_auth(text, route.active_config_provider())?
     {
         return Err("路由认证字段已被外部修改，已保留当前配置；请恢复路由认证设置后再操作".into());
@@ -643,18 +651,21 @@ where
         .map(|r| r.config_provider.clone())
         .unwrap_or(config::selected_provider(text)?);
     let needs_http_config = old_route.as_ref().is_none_or(|r| {
-        r.http_transport.as_ref().is_none_or(|transport| {
-            r.config_provider != "openai" && transport.previous_auth_fields.is_none()
-        })
+        (r.config_provider == "openai" && !r.native_openai)
+            || r.http_transport.as_ref().is_none_or(|transport| {
+                r.config_provider != "openai" && transport.previous_auth_fields.is_none()
+            })
     });
-    if needs_http_config {
+    if needs_http_config && config_provider != "openai" {
         config::capture_route_transport(text, &config_provider)?;
     }
     let had_live_official = live_auth.as_deref().is_some_and(is_official_credential);
     // Provider IDs must change once for the built-in openai provider: Codex ignores
     // capability overrides on that built-in ID. Stop writers before migrating history.
-    let migrate_history = needs_http_config && config_provider == "openai";
-    if migrate_history || live_auth.as_deref() != Some(auth.as_slice()) {
+    let migrate_history = needs_http_config
+        && config_provider == "openai"
+        && old_route.as_ref().is_some_and(|route| !route.native_openai);
+    if needs_http_config || live_auth.as_deref() != Some(auth.as_slice()) {
         close_codex()?;
     }
     let original = read_optional_file(&codex_home.join("config.toml"))?;
@@ -664,16 +675,29 @@ where
     } else if config::selected_provider(text)? != config_provider {
         return Err("准备路由期间提供方已被外部修改，请重新操作".into());
     }
+    let direct_text = if let Some(route) = &old_route {
+        if config_provider == "openai" && needs_http_config {
+            config::restore_route_config(text, route)?
+        } else {
+            text.to_string()
+        }
+    } else {
+        text.to_string()
+    };
     let http_transport = match &old_route {
         Some(route) if route.http_transport.is_some() => {
             let mut transport = route.http_transport.clone().unwrap();
             if needs_http_config {
                 transport.previous_auth_fields =
-                    config::capture_route_transport(text, &config_provider)?.previous_auth_fields;
+                    config::capture_route_transport(&direct_text, &config_provider)?
+                        .previous_auth_fields;
             }
             Some(transport)
         }
-        _ => Some(config::capture_route_transport(text, &config_provider)?),
+        _ => Some(config::capture_route_transport(
+            &direct_text,
+            &config_provider,
+        )?),
     };
     let previous_base_url = match &old_route {
         Some(route) => route.previous_base_url.clone(),
@@ -702,17 +726,15 @@ where
     let base_url = gateway::local_base_url(prepared.port());
     let updated = if !needs_http_config {
         text.to_string()
+    } else if config_provider == "openai" {
+        config::with_native_openai_route(&direct_text, &base_url)?
     } else {
-        let direct_text = if old_route.is_some() && config_provider == "openai" {
-            config::with_provider_base_url(text, "openai", previous_base_url.as_deref())?
-        } else {
-            text.to_string()
-        };
         config::with_http_route(&direct_text, &config_provider, &base_url)?
     };
     settings.keep_official_auth = true;
     settings.official_route = Some(profiles::OfficialRoute {
         provider_id: id.into(),
+        native_openai: config_provider == "openai",
         config_provider,
         previous_base_url,
         local_base_url: base_url,
@@ -743,7 +765,7 @@ where
             codex_home,
             original.as_deref(),
             updated.as_bytes(),
-            migrate_history.then_some(config::HTTP_ROUTE_PROVIDER_ID),
+            migrate_history.then_some("openai"),
             auth_update,
             &settings_bytes,
         )?
@@ -751,8 +773,7 @@ where
     report.warnings.extend(prepared.commit());
     if needs_http_config {
         report.warnings.push(
-            "已启用 HTTP/SSE 本地路由，请重新打开 Codex；此后切换线路无需重启，CSwitch 需保持运行"
-                .into(),
+            "已启用本地路由，请重新打开 Codex；此后切换线路无需重启，CSwitch 需保持运行".into(),
         );
     }
     progress.finish(2);
@@ -792,8 +813,9 @@ where
     } else {
         None
     };
-    let migrate_history = route.http_transport.is_some() && route.config_provider == "openai";
-    if migrate_history || direct_auth.is_some() {
+    let migrate_history =
+        route.http_transport.is_some() && route.config_provider == "openai" && !route.native_openai;
+    if migrate_history || route.native_openai || direct_auth.is_some() {
         close_codex()?;
     }
     if let Some(target) = direct_auth.as_deref() {

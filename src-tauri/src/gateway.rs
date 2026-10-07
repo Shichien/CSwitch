@@ -476,6 +476,7 @@ fn stop_state(path: &Path, state: &GatewayState) -> Result<(), Box<dyn Error>> {
 #[derive(Clone)]
 struct Runtime {
     target: Destination,
+    native_openai: bool,
     state: GatewayState,
     client: reqwest::Client,
     shutdown: Arc<Notify>,
@@ -518,7 +519,7 @@ impl Destination {
     }
 }
 
-fn selected_destination(home: &Path) -> Result<Destination, Box<dyn Error>> {
+fn selected_destination(home: &Path) -> Result<(Destination, bool), Box<dyn Error>> {
     let store = ProfileStore::new(home);
     let route = store
         .load_settings()?
@@ -530,13 +531,17 @@ fn selected_destination(home: &Path) -> Result<Destination, Box<dyn Error>> {
         } else {
             None
         };
-        Ok(Destination::Official(base.unwrap_or_else(|| {
-            "https://chatgpt.com/backend-api/codex".into()
-        })))
+        Ok((
+            Destination::Official(
+                base.unwrap_or_else(|| "https://chatgpt.com/backend-api/codex".into()),
+            ),
+            route.native_openai,
+        ))
     } else {
-        Ok(Destination::Provider(Arc::new(
-            store.load_provider(&route.provider_id)?,
-        )))
+        Ok((
+            Destination::Provider(Arc::new(store.load_provider(&route.provider_id)?)),
+            route.native_openai,
+        ))
     }
 }
 
@@ -545,11 +550,13 @@ impl Runtime {
         let mut data = self.clone();
         if data.resident {
             let home = data.official_home.clone().ok_or("本地路由缺少凭据目录")?;
-            data.target = tokio::task::spawn_blocking(move || {
+            let (target, native_openai) = tokio::task::spawn_blocking(move || {
                 selected_destination(&home).map_err(|e| e.to_string())
             })
             .await
             .map_err(|e| e.to_string())??;
+            data.target = target;
+            data.native_openai = native_openai;
         }
         Ok(data)
     }
@@ -596,6 +603,7 @@ fn run_server(
         let shutdown = Arc::new(Notify::new());
         let data = Runtime {
             target,
+            native_openai: false,
             resident: owner_pid != 0,
             state: state.clone(),
             client: network::async_builder()?.build()?,
@@ -1100,6 +1108,9 @@ async fn websocket(
         Ok(true) => {}
         Ok(false) => return error(401, "本地路由请求凭据无效"),
         Err(e) => return error(500, &e),
+    }
+    if data.native_openai {
+        return error(426, "本地路由使用 HTTP Responses");
     }
     if data.target.protocol() != "openai_responses" {
         return error(501, "该转换供应商不支持 WebSocket");

@@ -46,6 +46,8 @@ pub struct OfficialRoute {
     pub direct_provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_transport: Option<RouteHttpTransport>,
+    #[serde(default)]
+    pub native_openai: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +61,8 @@ pub struct RouteHttpTransport {
 
 impl OfficialRoute {
     pub fn active_config_provider(&self) -> &str {
-        if self.http_transport.is_some() && self.config_provider == "openai" {
+        if self.http_transport.is_some() && self.config_provider == "openai" && !self.native_openai
+        {
             crate::config::HTTP_ROUTE_PROVIDER_ID
         } else {
             &self.config_provider

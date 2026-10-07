@@ -71,9 +71,10 @@ fn legacy_resident_route_upgrades_once_and_failed_migration_preserves_state() {
             Ok(true)
         })
         .unwrap();
-    assert_eq!(report.rollout_files_updated, 1);
+    assert_eq!(report.rollout_files_updated, 0);
     let routed = fs::read_to_string(home.join("config.toml")).unwrap();
     let route = profiles.load_settings().unwrap().official_route.unwrap();
+    assert!(route.native_openai);
     assert_eq!(route.local_base_url, base);
     verify_route_config(&routed, &route).unwrap();
     let history = fs::read(&rollout).unwrap();
@@ -107,6 +108,69 @@ fn legacy_resident_route_upgrades_once_and_failed_migration_preserves_state() {
         restored_history.split_once('\n').unwrap().1,
         original_history.split_once('\n').unwrap().1
     );
+}
+
+#[test]
+#[ignore = "uses CSWITCH_TEST_BINARY; run scripts/run-process-tests.py"]
+fn custom_openai_route_upgrades_to_native_provider() {
+    let dir = tempdir().unwrap();
+    let home = dir.path();
+    let direct = "model='gpt-6.1-sol'\nmodel_reasoning_effort='high'\n";
+    let base = gateway::local_base_url(0);
+    let routed = config::with_http_route(direct, "openai", &base).unwrap();
+    fs::write(home.join("config.toml"), &routed).unwrap();
+    fs::write(
+        home.join("auth.json"),
+        official_auth(chrono::Utc::now().timestamp() + 3600, "fixture-refresh"),
+    )
+    .unwrap();
+    fs::create_dir(home.join("sessions")).unwrap();
+    let rollout = home.join("sessions/rollout-fixture.jsonl");
+    fs::write(
+        &rollout,
+        b"{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"cswitch_local\"}}\n",
+    )
+    .unwrap();
+    let store = ProfileStore::new(home);
+    store
+        .save_settings(&AppSettings {
+            keep_official_auth: true,
+            official_route: Some(profiles::OfficialRoute {
+                provider_id: "openai".into(),
+                config_provider: "openai".into(),
+                previous_base_url: None,
+                local_base_url: base,
+                resident: true,
+                direct_provider_id: None,
+                http_transport: Some(config::capture_route_transport(direct, "openai").unwrap()),
+                native_openai: false,
+            }),
+        })
+        .unwrap();
+    let report =
+        activate_official_route_with_close(home, "openai", &ProgressReporter::default(), || {
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(report.rollout_files_updated, 1);
+    let updated = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert_eq!(config::selected_provider(&updated).unwrap(), "openai");
+    assert!(updated.contains("model_reasoning_effort='high'"));
+    assert!(!updated.contains("cswitch_local"));
+    assert!(
+        store
+            .load_settings()
+            .unwrap()
+            .official_route
+            .unwrap()
+            .native_openai
+    );
+    assert!(
+        fs::read_to_string(rollout)
+            .unwrap()
+            .contains("\"model_provider\":\"openai\"")
+    );
+    stop_official_route_with_close(home, false, || Ok(true)).unwrap();
 }
 
 fn fixture_request(server: &Server, key: &str, account: bool) -> tiny_http::Request {
@@ -186,18 +250,15 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
     activate_provider_inner_with_close(home, &pa.id, || Ok(true)).unwrap();
     let config_bytes = fs::read(home.join("config.toml")).unwrap();
     let config_text = String::from_utf8(config_bytes.clone()).unwrap();
+    assert_eq!(config::selected_provider(&config_text).unwrap(), "openai");
     assert_eq!(
-        config::selected_provider(&config_text).unwrap(),
-        config::HTTP_ROUTE_PROVIDER_ID
-    );
-    assert_eq!(
-        config::provider_websockets(&config_text, config::HTTP_ROUTE_PROVIDER_ID).unwrap(),
-        Some(false)
+        config::provider_websockets(&config_text, "openai").unwrap(),
+        None
     );
     let history_bytes = fs::read(home.join("sessions/rollout-fixture.jsonl")).unwrap();
     let db_bytes = fs::read(home.join("state_5.sqlite")).unwrap();
-    assert!(String::from_utf8_lossy(&history_bytes).contains(config::HTTP_ROUTE_PROVIDER_ID));
-    let base = config::provider_base_url(&config_text, config::HTTP_ROUTE_PROVIDER_ID)
+    assert!(String::from_utf8_lossy(&history_bytes).contains("\"model_provider\":\"openai\""));
+    let base = config::provider_base_url(&config_text, "openai")
         .unwrap()
         .unwrap();
     let port = gateway::route_port(&base).unwrap();
@@ -408,7 +469,7 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
 #[test]
 #[ignore = "uses CSWITCH_TEST_BINARY; isolated resident WebSocket integration"]
 #[allow(clippy::result_large_err)] // Tungstenite fixes the handshake callback's response error type.
-fn resident_switches_websocket_at_request_boundary_and_rejects_cross_provider_response_ids() {
+fn legacy_websocket_switches_at_request_boundary_and_rejects_cross_provider_response_ids() {
     use std::net::TcpListener;
     use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
     let dir = tempdir().unwrap();
@@ -493,8 +554,12 @@ fn resident_switches_websocket_at_request_boundary_and_rejects_cross_provider_re
         })
         .unwrap();
     activate_provider_inner_with_close(home, &pa.id, || Ok(true)).unwrap();
+    let store = ProfileStore::new(home);
+    let mut settings = store.load_settings().unwrap();
+    settings.official_route.as_mut().unwrap().native_openai = false;
+    store.save_settings(&settings).unwrap();
     let source = fs::read_to_string(home.join("config.toml")).unwrap();
-    let base = config::provider_base_url(&source, config::HTTP_ROUTE_PROVIDER_ID)
+    let base = config::provider_base_url(&source, "openai")
         .unwrap()
         .unwrap();
     let mut request = format!("{base}/responses")
@@ -513,7 +578,8 @@ fn resident_switches_websocket_at_request_boundary_and_rejects_cross_provider_re
     ))
     .unwrap();
     assert!(ws.read().unwrap().to_text().unwrap().contains("from-a"));
-    activate_provider_inner_with_close(home, &pb.id, || panic!("closed Codex")).unwrap();
+    settings.official_route.as_mut().unwrap().provider_id = pb.id;
+    store.save_settings(&settings).unwrap();
     ws.send(Message::Text(
         r#"{"type":"response.create","previous_response_id":"from-a","input":"incremental"}"#
             .into(),

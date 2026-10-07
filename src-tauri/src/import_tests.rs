@@ -255,6 +255,7 @@ fn snapshot_never_replaces_provider_key_with_unrelated_live_auth() {
 fn route_temporarily_replaces_and_restores_imported_auth_fields() {
     let source = "model_provider = 'my-provider'\nmodel = 'user-model'\n[model_providers.my-provider]\nname = 'Imported'\nbase_url = 'https://fixture.test'\nenv_key = 'FIXTURE_KEY'\nenv_key_instructions = 'custom instructions'\nrequires_openai_auth = false\nexperimental_bearer_token = 'old-bearer'\nhttp_headers = { authorization = 'Bearer old-header', 'X-Tenant' = 'tenant' }\nenv_http_headers = { Authorization = 'HEADER_ENV', 'X-User' = 'USER_ENV' }\nrequest_max_retries = 6\n";
     let route = profiles::OfficialRoute {
+        native_openai: false,
         provider_id: "fixture".into(),
         config_provider: "my-provider".into(),
         previous_base_url: Some("https://fixture.test".into()),

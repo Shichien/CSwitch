@@ -819,17 +819,9 @@ fn keep_official_auth_preserves_chatgpt_tokens_and_only_changes_route() {
     );
     let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
     let document = parse_config(&config).expect("parse config");
-    assert_eq!(
-        document["model_provider"].as_str(),
-        Some(config::HTTP_ROUTE_PROVIDER_ID)
-    );
-    assert_eq!(
-        document["model_providers"][config::HTTP_ROUTE_PROVIDER_ID]["supports_websockets"]
-            .as_bool(),
-        Some(false)
-    );
+    assert!(document.get("model_provider").is_none());
     assert!(
-        document["model_providers"][config::HTTP_ROUTE_PROVIDER_ID]["base_url"]
+        document["openai_base_url"]
             .as_str()
             .unwrap()
             .starts_with("http://127.0.0.1:")
@@ -1027,10 +1019,10 @@ fn cleanup_failure_keeps_provider_list_and_reports_warning() {
 #[test]
 #[ignore = "uses CSWITCH_TEST_BINARY; run scripts/run-process-tests.py"]
 #[allow(clippy::result_large_err)] // tungstenite handshake callback requires an HTTP error response by value.
-fn official_route_migrates_history_and_keeps_legacy_websocket_clients_working() {
+fn official_route_keeps_native_history_and_falls_back_to_http() {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::thread;
-    use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
+    use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
     let home = tempdir().unwrap();
     let root = home.path();
     let auth = official_auth(chrono::Utc::now().timestamp() + 3600, "fixture-refresh");
@@ -1101,32 +1093,6 @@ fn official_route_migrates_history_and_keeps_legacy_websocket_clients_working() 
             let payload = "data: {\"type\":\"response.completed\",\"fixture\":true}\n\n";
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).as_bytes()).unwrap();
         }
-        let (socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
-            .unwrap();
-        let mut socket = tungstenite::accept_hdr(
-            socket,
-            |request: &tungstenite::handshake::server::Request, response| {
-                assert_eq!(request.uri().path(), "/responses");
-                assert_eq!(
-                    request.headers()["authorization"],
-                    "Bearer upstream-fixture-key"
-                );
-                assert!(request.headers().get("ChatGPT-Account-Id").is_none());
-                Ok(response)
-            },
-        )
-        .unwrap();
-        let message = socket.read().unwrap();
-        assert_eq!(message.to_text().unwrap(), "websocket-fixture");
-        socket.send(message).unwrap();
-        drop(socket);
-        let (mut denied, _) = listener.accept().unwrap();
-        // An HTTP-only provider must retain its original handshake status for the client.
-        let mut bytes = [0u8; 4096];
-        let _ = denied.read(&mut bytes).unwrap();
-        denied.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
     });
     let state = set_keep_official_auth_inner(root, true).unwrap();
     assert_eq!(
@@ -1135,11 +1101,8 @@ fn official_route_migrates_history_and_keeps_legacy_websocket_clients_working() 
     );
     assert!(!state.official_active);
     let routed = fs::read_to_string(root.join("config.toml")).unwrap();
-    assert_eq!(
-        config::selected_provider(&routed).unwrap(),
-        config::HTTP_ROUTE_PROVIDER_ID
-    );
-    let url = config::provider_base_url(&routed, config::HTTP_ROUTE_PROVIDER_ID)
+    assert_eq!(config::selected_provider(&routed).unwrap(), "openai");
+    let url = config::provider_base_url(&routed, "openai")
         .unwrap()
         .unwrap();
     let client = reqwest::blocking::Client::builder()
@@ -1181,15 +1144,9 @@ fn official_route_migrates_history_and_keeps_legacy_websocket_clients_working() 
     request
         .headers_mut()
         .insert("ChatGPT-Account-Id", "must-not-leak".parse().unwrap());
-    let (mut websocket, _) = tungstenite::connect(request).unwrap();
-    websocket
-        .send(Message::Text("websocket-fixture".into()))
-        .unwrap();
-    assert_eq!(
-        websocket.read().unwrap().to_text().unwrap(),
-        "websocket-fixture"
+    assert!(
+        matches!(tungstenite::connect(request), Err(tungstenite::Error::Http(response)) if response.status().as_u16()==426)
     );
-    drop(websocket);
     let mut denied_request = format!("{url}/responses")
         .replacen("http:", "ws:", 1)
         .into_client_request()
@@ -1199,7 +1156,7 @@ fn official_route_migrates_history_and_keeps_legacy_websocket_clients_working() 
         format!("Bearer {official_token}").parse().unwrap(),
     );
     assert!(
-        matches!(tungstenite::connect(denied_request), Err(tungstenite::Error::Http(response)) if response.status().as_u16()==405)
+        matches!(tungstenite::connect(denied_request), Err(tungstenite::Error::Http(response)) if response.status().as_u16()==426)
     );
     server.join().unwrap();
     fs::write(
@@ -1338,6 +1295,7 @@ fn disabling_custom_route_saves_rotated_official_credentials() {
         .save_settings(&AppSettings {
             keep_official_auth: true,
             official_route: Some(profiles::OfficialRoute {
+                native_openai: false,
                 resident: false,
                 http_transport: None,
                 direct_provider_id: None,
@@ -1402,6 +1360,7 @@ fn official_snapshot_never_restores_a_retired_local_proxy() {
         .save_settings(&AppSettings {
             keep_official_auth: true,
             official_route: Some(profiles::OfficialRoute {
+                native_openai: false,
                 resident: false,
                 http_transport: None,
                 direct_provider_id: None,
@@ -1453,6 +1412,7 @@ fn http_route_restores_original_transport_and_preserves_user_edits() {
         ),
     ] {
         let route = profiles::OfficialRoute {
+            native_openai: false,
             provider_id: "fixture".into(),
             config_provider: provider.into(),
             previous_base_url: config::provider_base_url(source, provider).unwrap(),
@@ -1502,11 +1462,42 @@ fn http_route_restores_original_transport_and_preserves_user_edits() {
         }
     }
     assert!(
-        config::capture_route_transport(
+        config::with_http_route(
             "[model_providers.cswitch_local]\nname='user-owned'\n",
-            "openai"
+            "openai",
+            "http://127.0.0.1:1234/v1"
         )
         .is_err()
+    );
+}
+
+#[test]
+fn native_openai_route_preserves_model_settings_and_restores_bearer() {
+    let source = "model_provider='openai'\nmodel='gpt-6.1-sol'\nmodel_reasoning_effort='high'\nexperimental_bearer_token='saved-token'\n[model_providers.cswitch_local]\nname='user-owned'\n";
+    let route = profiles::OfficialRoute {
+        provider_id: "openai".into(),
+        config_provider: "openai".into(),
+        previous_base_url: None,
+        local_base_url: "http://127.0.0.1:1234/v1".into(),
+        resident: true,
+        direct_provider_id: None,
+        http_transport: Some(config::capture_route_transport(source, "openai").unwrap()),
+        native_openai: true,
+    };
+    let routed = config::with_native_openai_route(source, &route.local_base_url).unwrap();
+    verify_route_config(&routed, &route).unwrap();
+    assert!(!routed.contains("saved-token"));
+    assert!(routed.contains("model_reasoning_effort='high'"));
+    assert!(routed.contains("name='user-owned'"));
+    let restored = config::restore_route_config(&routed, &route).unwrap();
+    assert_eq!(
+        parse_config(&restored).unwrap()["experimental_bearer_token"].as_str(),
+        Some("saved-token")
+    );
+    assert!(restored.contains("name='user-owned'"));
+    assert_eq!(
+        config::provider_base_url(&restored, "openai").unwrap(),
+        None
     );
 }
 
