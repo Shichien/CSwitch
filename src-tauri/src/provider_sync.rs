@@ -35,6 +35,7 @@ pub struct ProviderCount {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSyncReport {
+    pub project_state_updated: bool,
     pub rollout_files_updated: usize,
     pub sqlite_rows_updated: usize,
     pub providers_detected: Vec<ProviderCount>,
@@ -84,6 +85,8 @@ struct RecoveryManifest {
     auth_replaced: bool,
     #[serde(default)]
     extra_sqlite_paths: Vec<String>,
+    #[serde(default)]
+    project_state_managed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,6 +379,26 @@ where
         AuthUpdate::Keep => true,
         AuthUpdate::Replace(auth) => original_auth.as_deref() == Some(auth),
     };
+    let project_path = codex_home.join(crate::project_sync::FILE_NAME);
+    // Hot route changes keep the desktop running and must never touch its state.
+    let original_projects = if sync_history || !auth_unchanged {
+        match fs::read(&project_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let project_auth = match auth_update {
+        AuthUpdate::Keep => original_auth.as_deref(),
+        AuthUpdate::Replace(auth) => Some(auth),
+    };
+    let updated_projects = original_projects
+        .as_deref()
+        .map(|bytes| crate::project_sync::prepare(bytes, project_auth))
+        .transpose()?
+        .flatten();
     let changes = if sync_history {
         collect_rollout_changes(codex_home, target_provider)?
     } else {
@@ -424,6 +447,7 @@ where
         && config_unchanged
         && auth_unchanged
         && settings_unchanged
+        && updated_projects.is_none()
     {
         before_config_write()?;
         return Ok(unchanged_sync_report());
@@ -462,6 +486,8 @@ where
     let required = largest
         .saturating_mul(2)
         .saturating_add(database_size)
+        .saturating_add(original_projects.as_ref().map_or(0, |b| b.len() as u64))
+        .saturating_add(updated_projects.as_ref().map_or(0, |b| b.len() as u64 * 2))
         .saturating_add(1024 * 1024);
     let free = fs2::available_space(codex_home)?;
     if free < required {
@@ -501,6 +527,13 @@ where
         atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
     }
     // Persist intended bytes before publishing the journal, so recovery can detect later user edits.
+    if let Some(bytes) = updated_projects.as_deref() {
+        write_new_file(
+            &backup_dir.join("global-state.json"),
+            original_projects.as_deref().expect("project baseline"),
+        )?;
+        write_new_file(&backup_dir.join("global-state.applied.json"), bytes)?;
+    }
     write_new_file(&backup_dir.join("config.applied.toml"), updated_config)?;
     if let AuthUpdate::Replace(auth) = auth_update {
         write_new_file(&backup_dir.join("auth.applied.json"), auth)?;
@@ -520,6 +553,7 @@ where
     })?;
     manifest["checkedFiles"] = Value::Bool(true);
     manifest["authReplaced"] = Value::Bool(matches!(auth_update, AuthUpdate::Replace(_)));
+    manifest["projectStateManaged"] = Value::Bool(updated_projects.is_some());
     atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
     let mut journal = begin_transaction(codex_home, &backup_dir)?;
 
@@ -529,6 +563,7 @@ where
     let mut config_written = false;
     let mut auth_mutated = false;
     let mut settings_mutated = false;
+    let mut projects_mutated = false;
 
     let result = (|| -> Result<ProviderSyncReport, Box<dyn Error>> {
         for (index, change) in changes.iter().enumerate() {
@@ -559,6 +594,16 @@ where
         };
 
         before_config_write()?;
+        if original_projects.is_some() {
+            ensure_file_unchanged(&project_path, original_projects.as_deref())?;
+        }
+        if let Some(bytes) = updated_projects.as_deref() {
+            projects_mutated = true;
+            atomic_write(&project_path, bytes)?;
+            if fs::read(&project_path)? != bytes {
+                return Err("项目状态写后校验失败".into());
+            }
+        }
         ensure_file_unchanged(&config_path, original_config)?;
         if !config_unchanged {
             config_written = true;
@@ -602,6 +647,7 @@ where
             }
         }
         Ok(ProviderSyncReport {
+            project_state_updated: projects_mutated,
             warnings: Vec::new(),
             rollout_files_updated: changes.len(),
             sqlite_rows_updated,
@@ -633,6 +679,13 @@ where
                 {
                     rollback_errors.push(format!("恢复设置失败：{error}"));
                 }
+                rollback_project_state(
+                    &project_path,
+                    original_projects.as_deref(),
+                    updated_projects.as_deref(),
+                    projects_mutated,
+                    &mut rollback_errors,
+                );
                 return finish_failed_transaction(
                     codex_home,
                     format!("无法提交同步事务：{error}"),
@@ -672,6 +725,13 @@ where
             {
                 rollback_errors.push(format!("恢复设置失败：{error}"));
             }
+            rollback_project_state(
+                &project_path,
+                original_projects.as_deref(),
+                updated_projects.as_deref(),
+                projects_mutated,
+                &mut rollback_errors,
+            );
             finish_failed_transaction(codex_home, error.to_string(), rollback_errors, &backup_dir)
         }
     }
@@ -679,6 +739,7 @@ where
 
 fn unchanged_sync_report() -> ProviderSyncReport {
     ProviderSyncReport {
+        project_state_updated: false,
         rollout_files_updated: 0,
         sqlite_rows_updated: 0,
         providers_detected: Vec::new(),
@@ -686,6 +747,33 @@ fn unchanged_sync_report() -> ProviderSyncReport {
         warnings: Vec::new(),
     }
 }
+
+fn rollback_project_state(
+    path: &Path,
+    original: Option<&[u8]>,
+    intended: Option<&[u8]>,
+    mutated: bool,
+    errors: &mut Vec<String>,
+) {
+    if !mutated {
+        return;
+    }
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let current = fs::read(path)?;
+        if Some(current.as_slice()) == original {
+            return Ok(());
+        }
+        ensure_file_unchanged(path, intended)?;
+        restore_optional_file(path, original)
+    })();
+    if let Err(error) = result {
+        errors.push(format!("恢复项目状态失败：{error}"));
+    }
+}
+
+#[cfg(test)]
+#[path = "project_sync_transaction_tests.rs"]
+mod project_sync_transaction_tests;
 
 fn finish_failed_transaction<T>(
     codex_home: &Path,
@@ -863,6 +951,13 @@ fn restore_from_recovery_manifest(
                 manifest.settings_present,
                 manifest.settings_managed,
             ),
+            (
+                "global-state.json",
+                "global-state.applied.json",
+                codex_home.join(crate::project_sync::FILE_NAME),
+                true,
+                manifest.project_state_managed,
+            ),
         ] {
             if !managed {
                 continue;
@@ -935,6 +1030,16 @@ fn restore_from_recovery_manifest(
             settings.as_deref(),
         ) {
             errors.push(format!("恢复设置失败：{error}"));
+        }
+    }
+    if manifest.project_state_managed {
+        let result = fs::read(backup_dir.join("global-state.json"))
+            .map_err(|e| -> Box<dyn Error> { e.into() })
+            .and_then(|bytes| {
+                atomic_write(&codex_home.join(crate::project_sync::FILE_NAME), &bytes)
+            });
+        if let Err(error) = result {
+            errors.push(format!("恢复项目状态失败：{error}"));
         }
     }
     if let Some(destination) = manifest.sqlite_path.as_deref() {

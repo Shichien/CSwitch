@@ -226,7 +226,7 @@ function App() {
 
   const reportSuccess = (name: string, report: ProviderSyncReport) => {
     const text = switchedNotice(name, Math.max(report.rolloutFilesUpdated, report.sqliteRowsUpdated));
-    showNotice(report.warnings?.length ? "error" : "success", [text, ...(report.warnings ?? [])].join("\n"));
+    showNotice(report.warnings?.length ? "error" : "success", [text, ...(report.projectStateUpdated ? ["本地项目已同步"] : []), ...(report.warnings ?? [])].join("\n"));
   };
 
   const refresh = useCallback(async () => {

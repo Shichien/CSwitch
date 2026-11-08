@@ -10,6 +10,7 @@ mod oauth;
 mod operation_lock;
 mod profiles;
 mod progress;
+mod project_sync;
 mod provider_import;
 mod provider_sync;
 mod provider_usage;

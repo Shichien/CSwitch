@@ -582,6 +582,7 @@ pub(crate) fn verify_route_config(
 
 fn empty_route_report() -> ProviderSyncReport {
     ProviderSyncReport {
+        project_state_updated: false,
         rollout_files_updated: 0,
         sqlite_rows_updated: 0,
         providers_detected: Vec::new(),

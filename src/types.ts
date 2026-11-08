@@ -94,6 +94,7 @@ export interface SavedProvider {
 }
 
 export interface ProviderSyncReport {
+  projectStateUpdated: boolean;
   rolloutFilesUpdated: number;
   sqliteRowsUpdated: number;
   backupPath: string;
