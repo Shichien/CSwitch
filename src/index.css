@@ -151,6 +151,29 @@ button:disabled {
   align-items: center;
 }
 
+.autostart-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.autostart-button.enabled {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.autostart-button:disabled { opacity: 0.5; cursor: default; }
+
 .route-control {
   position: relative;
   min-width: 0;
@@ -1013,4 +1036,5 @@ main {
 .add-menu-options button:hover { background: var(--surface-muted); }
 .official-card .provider-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .official-card .provider-select > svg { flex-shrink: 0; }
+.official-card .provider-actions { align-self: start; padding-top: 10px; }
 @media (prefers-reduced-motion: reduce) { .add-menu-options { animation: none; } }

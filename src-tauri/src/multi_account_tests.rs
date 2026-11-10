@@ -362,3 +362,88 @@ fn saving_legacy_snapshot_never_overwrites_reauthenticated_live_identity() {
         "fresh"
     );
 }
+
+#[test]
+fn deleting_an_account_removes_only_its_snapshot_and_keeps_the_live_one() {
+    let home = tempdir().unwrap();
+    let home = home.path();
+    let a = auth("space-a", "user-a", "a@example.invalid", "a-token");
+    write_live(home, &a);
+    let store = Store::new(home);
+    let kept = store.save(&a).unwrap();
+    let removed = store
+        .save(&auth("space-b", "user-b", "b@example.invalid", "b-token"))
+        .unwrap();
+    let report = delete_official_account(home, &removed.id).unwrap();
+    assert!(report.warnings.is_empty());
+    let rows = store.list().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, kept.id);
+    assert_eq!(fs::read(home.join("auth.json")).unwrap(), a);
+    assert_eq!(
+        list_provider_state_read_only(home)
+            .unwrap()
+            .official_accounts
+            .len(),
+        1
+    );
+    assert!(delete_official_account(home, &removed.id).is_err());
+}
+
+#[test]
+fn the_account_backing_the_live_login_cannot_be_deleted() {
+    let home = tempdir().unwrap();
+    let home = home.path();
+    let a = auth("space-a", "user-a", "a@example.invalid", "a-token");
+    write_live(home, &a);
+    let store = Store::new(home);
+    let live = store.save(&a).unwrap();
+    store
+        .save(&auth("space-b", "user-b", "b@example.invalid", "b-token"))
+        .unwrap();
+    let error = delete_official_account(home, &live.id).unwrap_err();
+    assert!(error.to_string().contains("当前正在使用"));
+    assert_eq!(store.list().unwrap().len(), 2);
+    assert_eq!(fs::read(home.join("auth.json")).unwrap(), a);
+}
+
+#[test]
+fn an_account_becomes_deletable_once_another_line_is_active() {
+    let home = tempdir().unwrap();
+    let home = home.path();
+    let a = auth("space-a", "user-a", "a@example.invalid", "a-token");
+    write_live(home, &a);
+    let store = Store::new(home);
+    let previous = store.save(&a).unwrap();
+    // Switching to an API provider replaces the live credential with an API key.
+    fs::write(
+        home.join("auth.json"),
+        br#"{"OPENAI_API_KEY":"fixture-key"}"#,
+    )
+    .unwrap();
+    let state = list_provider_state_read_only(home).unwrap();
+    assert!(!state.official_accounts.iter().any(|account| account.active));
+    delete_official_account(home, &previous.id).unwrap();
+    assert!(store.list().unwrap().is_empty());
+    assert_eq!(
+        fs::read(home.join("auth.json")).unwrap(),
+        br#"{"OPENAI_API_KEY":"fixture-key"}"#
+    );
+}
+
+#[test]
+fn interrupted_deletion_tombstones_are_cleaned_up_and_never_listed() {
+    let home = tempdir().unwrap();
+    let home = home.path();
+    let store = Store::new(home);
+    let row = store
+        .save(&auth("space-a", "user-a", "a@example.invalid", "a-token"))
+        .unwrap();
+    store.delete(&row.id).unwrap();
+    let tombstone = home
+        .join("cswitch-profiles/official-accounts")
+        .join(format!(".deleting-{}.json", row.id));
+    fs::write(&tombstone, b"partial").unwrap();
+    assert!(store.list().unwrap().is_empty());
+    assert!(!tombstone.exists());
+}

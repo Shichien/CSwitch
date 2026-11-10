@@ -1,6 +1,6 @@
 [package]
 name = "cswitch"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 license = "MIT"
 description = "Codex provider switcher"
@@ -16,6 +16,7 @@ futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "fs"] }
 sysinfo = "0.37"
 tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
 base64 = "0.22.1"
 chrono = "0.4.42"
 directories = "6.0.0"

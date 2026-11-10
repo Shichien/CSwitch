@@ -7,6 +7,7 @@ import {
   Plus,
   KeyRound,
   RefreshCw,
+  Trash2,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -191,12 +192,16 @@ function App() {
   const [state, setState] = useState<ProviderState>(EMPTY_STATE);
   const [busy, setBusy] = useState<BusyAction>("load");
   const [notice, setNotice] = useState<Notice>(null);
+  const [autostart, setAutostart] = useState<boolean | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const autostartInFlight = useRef(false);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const addMenuRef = useRef<HTMLDivElement>(null);
   const [providerDialogOpen, setProviderDialogOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<ProviderSummary | null>(null);
   const [routingProvider, setRoutingProvider] = useState<ProviderSummary | null>(null);
   const [deletingProvider, setDeletingProvider] = useState<ProviderSummary | null>(null);
+  const [deletingAccount, setDeletingAccount] = useState<OfficialAccountSummary | null>(null);
   const [progress, setProgress] = useState<OperationProgress | null>(null);
   const [officialUsage, setOfficialUsage] = useState<Record<string, OfficialUsageView>>({});
   const [providerUsage, setProviderUsage] = useState<Record<string, ProviderUsageView>>({});
@@ -223,6 +228,37 @@ function App() {
     setNotice({ kind, text });
     noticeTimer.current = window.setTimeout(() => setNotice(null), 3000);
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    void cswitchApi.getAutostart().then((enabled) => {
+      if (!disposed) setAutostart(enabled);
+    }).catch((error) => {
+      if (!disposed) showNotice("error", errorText(error));
+    });
+    return () => { disposed = true; };
+  }, [showNotice]);
+
+  const toggleAutostart = async () => {
+    if (autostartInFlight.current) return;
+    autostartInFlight.current = true;
+    setAutostartBusy(true);
+    try {
+      if (autostart === null) {
+        setAutostart(await cswitchApi.getAutostart());
+        return;
+      }
+      const enabled = await cswitchApi.setAutostart(!autostart);
+      setAutostart(enabled);
+      showNotice("success", enabled ? "已开启开机自启动" : "已关闭开机自启动");
+    } catch (error) {
+      setAutostart(null);
+      showNotice("error", errorText(error));
+    } finally {
+      autostartInFlight.current = false;
+      setAutostartBusy(false);
+    }
+  };
 
   const reportSuccess = (name: string, report: ProviderSyncReport) => {
     const text = switchedNotice(name, Math.max(report.rolloutFilesUpdated, report.sqliteRowsUpdated));
@@ -284,7 +320,8 @@ function App() {
 
   const isLoading = busy === "load";
   const locked = Boolean(busy) || Boolean(progress);
-  const hasDialog = providerDialogOpen || Boolean(routingProvider) || Boolean(deletingProvider) || Boolean(progress);
+  const hasDialog = providerDialogOpen || Boolean(routingProvider) || Boolean(deletingProvider)
+    || Boolean(deletingAccount) || Boolean(progress);
   const officialAccountKey = state.officialAccounts.map((account) => account.id).join(",");
   const providerUsageKey = state.providers
     .map((provider) => `${provider.id}:${provider.apiUrl}:${provider.hasApiKey}`)
@@ -562,6 +599,24 @@ function App() {
     }
   };
 
+  const removeAccount = async () => {
+    if (!deletingAccount || !beginAction()) return;
+    setBusy("delete-official");
+    try {
+      await cswitchApi.deleteOfficialAccount(deletingAccount.id);
+      setDeletingAccount(null);
+      await refresh();
+      showNotice("success", "官方账号已删除");
+    } catch (error) {
+      // Keep the dialog open only when the account is still in use; that error is actionable.
+      if (!String(errorText(error)).includes("当前正在使用")) setDeletingAccount(null);
+      showNotice("error", errorText(error));
+    } finally {
+      inFlight.current = false;
+      setBusy(null);
+    }
+  };
+
   const useOfficial = async (account?: OfficialAccountSummary, adding = false) => {
     if (!beginAction()) return;
     setAddMenuOpen(false);
@@ -700,6 +755,14 @@ function App() {
           </button>
           <label id="resident-route-label" htmlFor="resident-route">路由模式</label>
         </div>
+        <button className={`autostart-button${autostart ? " enabled" : ""}`}
+          type="button" aria-pressed={autostart === true} aria-busy={autostartBusy}
+          title={autostart === null ? "点击重新读取开机自启动状态" : autostart ? "已开启，点击关闭" : "已关闭，点击开启"}
+          disabled={locked || autostartBusy}
+          onClick={() => void toggleAutostart()}>
+          {autostartBusy ? <LoaderCircle className="spinner" size={14} /> : autostart === true ? <Check size={14} /> : null}
+          {autostart === null ? "自启动状态未知" : "开机自启动"}
+        </button>
         <div ref={addMenuRef} className="add-menu" onBlur={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget)) setAddMenuOpen(false);
         }}>
@@ -746,6 +809,15 @@ function App() {
                   </span>
                   {busy === "official" ? <LoaderCircle className="spinner" size={18} /> : <LogIn size={18} />}
                 </button>
+                <div className="provider-actions">
+                  <button className="icon-button delete-button" type="button"
+                    aria-label={`删除官方账号 ${account.label}`}
+                    title={account.active ? "当前账号不能删除，请先切换到其他线路" : "删除"}
+                    disabled={locked || account.active}
+                    onClick={() => setDeletingAccount(account)}>
+                    <Trash2 size={16} />
+                  </button>
+                </div>
                 <OfficialUsagePanel
                   account={account}
                   usage={usage}
@@ -864,6 +936,20 @@ function App() {
             if (busy !== "delete") setDeletingProvider(null);
           }}
           onConfirm={() => void removeProvider()}
+        />
+      )}
+
+      {deletingAccount && (
+        <ConfirmDialog
+          title="删除官方账号"
+          message={`确定删除 ${deletingAccount.label} 吗？保存的登录凭据会一并删除，之后需要重新登录才能使用这个账号。`}
+          confirmLabel="删除"
+          destructive
+          busy={busy === "delete-official"}
+          onCancel={() => {
+            if (busy !== "delete-official") setDeletingAccount(null);
+          }}
+          onConfirm={() => void removeAccount()}
         />
       )}
     </div>

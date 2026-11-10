@@ -1579,6 +1579,26 @@ pub(crate) fn switch_official_account(
     )
 }
 
+pub(crate) fn delete_official_account(
+    home: &Path,
+    id: &str,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    let accounts = crate::official_accounts::Store::new(home);
+    let account = accounts.load(id)?;
+    // The live auth.json is re-imported on every list, so it must never still belong
+    // to the account being deleted. Refresh it first to keep the newest refresh token.
+    if let Some(live) =
+        read_optional_file(&home.join("auth.json"))?.filter(|auth| is_official_credential(auth))
+    {
+        accounts.sync_live(&live)?;
+        if crate::official_accounts::identity(&live).as_ref() == Some(&account.identity) {
+            return Err("当前正在使用这个官方账号，请先切换到其他线路再删除".into());
+        }
+    }
+    accounts.delete(id)?;
+    Ok(empty_route_report())
+}
+
 fn switch_official_account_with<C, V>(
     home: &Path,
     id: &str,

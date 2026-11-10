@@ -12,6 +12,8 @@ import type {
 } from "../types";
 
 export const cswitchApi = {
+  getAutostart: () => invoke<boolean>("get_autostart"),
+  setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
   resizeWindow: (height: number) => getCurrentWindow().setSize(new LogicalSize(window.innerWidth, height)),
   listProviders: () => invoke<ProviderState>("list_providers"),
   queryOfficialAccountUsage: (accountId: string) =>
@@ -36,6 +38,8 @@ export const cswitchApi = {
     invoke<ProviderState>("set_keep_official_auth", { enabled }),
   addOfficialAccount: () => invoke<ProviderSyncReport>("add_official_account"),
   activateOfficialAccount: (accountId: string) => invoke<ProviderSyncReport>("activate_official_account", { accountId }),
+  deleteOfficialAccount: (accountId: string) =>
+    invoke<ProviderSyncReport>("delete_official_account", { accountId }),
   startOfficialLogin: () =>
     invoke<ProviderSyncReport>("start_official_login"),
   cancelOfficialLogin: () => invoke<void>("cancel_official_login"),

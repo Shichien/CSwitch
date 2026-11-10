@@ -18,7 +18,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::Notify;
 
@@ -55,6 +55,56 @@ fn state_path(home: &Path) -> PathBuf {
 fn instances(home: &Path) -> PathBuf {
     home.join("cswitch-profiles/gateways")
 }
+// Startup creates stderr before publishing state. Keep recent orphan logs, including
+// failed-start diagnostics, well beyond START_TIMEOUT and any normal shutdown.
+const ORPHAN_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn cleanup_historical_logs(home: &Path) {
+    cleanup_historical_logs_at(home, SystemTime::now());
+}
+
+fn cleanup_historical_logs_at(home: &Path, now: SystemTime) {
+    let root = instances(home);
+    // Do not follow a redirected instance directory or log symlinks.
+    if !fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(id) = name.strip_suffix(".log") else {
+            continue;
+        };
+        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < ORPHAN_LOG_RETENTION)
+        {
+            continue;
+        }
+        // Any state entry (even malformed, a symlink, or inaccessible) protects
+        // its log. Only a confirmed missing state allows best-effort deletion.
+        if matches!(fs::symlink_metadata(path.with_extension("json")), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 fn state_paths(home: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut paths = Vec::new();
     let legacy = state_path(home);
@@ -240,6 +290,7 @@ pub(crate) fn prepare_resident(
 }
 
 pub(crate) fn restore_resident(home: &Path) -> Result<(), Box<dyn Error>> {
+    cleanup_historical_logs(home);
     let store = ProfileStore::new(home);
     let Some(route) = store.load_settings()?.official_route else {
         return Ok(());
@@ -278,6 +329,7 @@ fn prepare_gateway(
     official: bool,
     resident_port: Option<u16>,
 ) -> Result<PreparedGateway, Box<dyn Error>> {
+    cleanup_historical_logs(home);
     let id = format!("{:032x}", rand::random::<u128>());
     let root = instances(home);
     fs::create_dir_all(&root)?;
@@ -412,6 +464,7 @@ fn stop_matching(
             errors.push(error.to_string());
         }
     }
+    cleanup_historical_logs(home);
     Ok(errors)
 }
 fn control_client() -> Result<reqwest::blocking::Client, Box<dyn Error>> {
@@ -1315,6 +1368,188 @@ fn available_port() -> Result<u16, Box<dyn Error>> {
 fn run_process(home: &Path, provider: &str, port: u16) -> Result<(), Box<dyn Error>> {
     run_server(home, provider, port, state_path(home), false, 0)
 }
+#[cfg(test)]
+mod log_cleanup_tests {
+    use super::*;
+
+    fn log(home: &Path, name: &str, age: Duration) -> PathBuf {
+        let root = instances(home);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(name);
+        let file = fs::File::create(&path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(SystemTime::now() - age))
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn removes_only_old_strictly_named_orphans_and_preserves_state_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let old = ORPHAN_LOG_RETENTION * 2;
+        let orphan = log(home.path(), "0123456789abcdef0123456789abcdef.log", old);
+        let uppercase = log(home.path(), "ABCDEF0123456789ABCDEF0123456789.log", old);
+        let active = log(home.path(), "11111111111111111111111111111111.log", old);
+        // Presence, not successful parsing or a health probe, protects the log.
+        fs::write(active.with_extension("json"), b"not-json").unwrap();
+        let state_directory = log(home.path(), "22222222222222222222222222222222.log", old);
+        fs::create_dir(state_directory.with_extension("json")).unwrap();
+        let names = [
+            "gateway.log",
+            "0123456789abcdef0123456789abcde.log",
+            "0123456789abcdef0123456789abcdef0.log",
+            "g123456789abcdef0123456789abcdef.log",
+            "44444444444444444444444444444444.LOG",
+            "0123456789abcdef0123456789abcdef.log.bak",
+        ];
+        let unrelated: Vec<_> = names
+            .iter()
+            .map(|name| log(home.path(), name, old))
+            .collect();
+        let directory = instances(home.path()).join("33333333333333333333333333333333.log");
+        fs::create_dir(&directory).unwrap();
+
+        cleanup_historical_logs(home.path());
+
+        assert!(!orphan.exists());
+        assert!(!uppercase.exists());
+        assert!(active.exists());
+        assert!(state_directory.exists());
+        assert!(directory.is_dir());
+        assert!(unrelated.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn preserves_startup_logs_recent_diagnostics_and_future_timestamps() {
+        let home = tempfile::tempdir().unwrap();
+        let startup = log(
+            home.path(),
+            "11111111111111111111111111111111.log",
+            Duration::ZERO,
+        );
+        let diagnostic = log(
+            home.path(),
+            "22222222222222222222222222222222.log",
+            ORPHAN_LOG_RETENTION / 2,
+        );
+        let future = log(
+            home.path(),
+            "33333333333333333333333333333333.log",
+            Duration::ZERO,
+        );
+        fs::File::options()
+            .write(true)
+            .open(&future)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + ORPHAN_LOG_RETENTION))
+            .unwrap();
+        cleanup_historical_logs(home.path());
+        assert!(startup.exists());
+        assert!(diagnostic.exists());
+        assert!(future.exists());
+    }
+
+    #[test]
+    fn restore_and_stop_cleanup_without_requiring_an_active_route() {
+        let home = tempfile::tempdir().unwrap();
+        let orphan = log(
+            home.path(),
+            "11111111111111111111111111111111.log",
+            ORPHAN_LOG_RETENTION * 2,
+        );
+        restore_resident(home.path()).unwrap();
+        assert!(!orphan.exists());
+        let orphan = log(
+            home.path(),
+            "22222222222222222222222222222222.log",
+            ORPHAN_LOG_RETENTION * 2,
+        );
+        stop(home.path()).unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn preparing_gateway_cleans_history_but_preserves_failed_start_diagnostics() {
+        let home = tempfile::tempdir().unwrap();
+        let orphan = log(
+            home.path(),
+            "11111111111111111111111111111111.log",
+            ORPHAN_LOG_RETENTION * 2,
+        );
+        assert!(
+            prepare_with_executable(
+                home.path(),
+                "fixture",
+                &home.path().join("missing-executable")
+            )
+            .is_err()
+        );
+        assert!(!orphan.exists());
+        let logs: Vec<_> = fs::read_dir(instances(home.path()))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        assert_eq!(logs.len(), 1, "keep the new failed-start diagnostic");
+        cleanup_historical_logs(home.path());
+        assert!(logs[0].exists());
+    }
+
+    #[test]
+    fn missing_or_invalid_cleanup_directory_is_non_fatal() {
+        let home = tempfile::tempdir().unwrap();
+        cleanup_historical_logs(home.path());
+        fs::create_dir_all(home.path().join("cswitch-profiles")).unwrap();
+        fs::write(instances(home.path()), b"not a directory").unwrap();
+        cleanup_historical_logs(home.path());
+        restore_resident(home.path()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_log_does_not_prevent_other_cleanup_or_stopping() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let locked = log(
+            home.path(),
+            "11111111111111111111111111111111.log",
+            ORPHAN_LOG_RETENTION * 2,
+        );
+        let orphan = log(
+            home.path(),
+            "22222222222222222222222222222222.log",
+            ORPHAN_LOG_RETENTION * 2,
+        );
+        let _handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&locked)
+            .unwrap();
+        stop(home.path()).unwrap();
+        assert!(locked.exists());
+        assert!(!orphan.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_log_symlinks_and_logs_with_dangling_state_symlinks() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let target = log(home.path(), "target.txt", ORPHAN_LOG_RETENTION * 2);
+        let link = instances(home.path()).join("11111111111111111111111111111111.log");
+        symlink(&target, &link).unwrap();
+        let protected = log(
+            home.path(),
+            "22222222222222222222222222222222.log",
+            ORPHAN_LOG_RETENTION * 2,
+        );
+        symlink(home.path().join("absent"), protected.with_extension("json")).unwrap();
+        cleanup_historical_logs(home.path());
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(target.exists());
+        assert!(protected.exists());
+    }
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;

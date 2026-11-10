@@ -5,13 +5,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_autostart::ManagerExt;
 
 use crate::app::{
     OfficialAccountUsage, OfficialAccountUsageProbe, ProviderState, SavedProvider,
-    activate_provider_inner_with_progress, delete_provider_inner, enable_provider_routing_inner,
-    ensure_provider_migration, list_provider_state, probe_official_account_usage,
-    query_provider_usage as query_provider_usage_inner, save_provider_inner,
-    set_keep_official_auth_with_progress, switch_to_official_with_progress,
+    activate_provider_inner_with_progress,
+    delete_official_account as delete_official_account_inner, delete_provider_inner,
+    enable_provider_routing_inner, ensure_provider_migration, list_provider_state,
+    probe_official_account_usage, query_provider_usage as query_provider_usage_inner,
+    save_provider_inner, set_keep_official_auth_with_progress, switch_to_official_with_progress,
 };
 use crate::progress::{self, ProgressReporter};
 use crate::{oauth, operation_lock, provider_sync, tray};
@@ -28,7 +30,10 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             tray::show_main_window(app)
         }))
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
+            get_autostart,
+            set_autostart,
             list_providers,
             query_official_account_usage,
             query_provider_usage,
@@ -41,6 +46,7 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
             start_official_login,
             add_official_account,
             activate_official_account,
+            delete_official_account,
             cancel_official_login
         ])
         .setup(|app| {
@@ -100,6 +106,27 @@ pub(crate) fn handle_tray_menu(app: &AppHandle, id: &str) {
             }
         }
     }
+}
+
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| format!("读取开机自启动状态失败：{error}"))
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|error| format!("设置开机自启动失败：{error}"))?;
+    manager
+        .is_enabled()
+        .map_err(|error| format!("确认开机自启动状态失败：{error}"))
 }
 
 #[tauri::command]
@@ -404,6 +431,31 @@ async fn activate_official_account(
     account_id: String,
 ) -> Result<ProviderSyncReport, String> {
     start_official_login_task(app, OfficialAction::Select(account_id)).await
+}
+
+#[tauri::command]
+async fn delete_official_account(
+    app: AppHandle,
+    account_id: String,
+) -> Result<ProviderSyncReport, String> {
+    let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
+    let task_home = codex_home.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = acquire_app_operation()
+            .map_err(|error| operation_error(&task_home, "获取应用操作锁", error))?;
+        let _process_guard = operation_lock::acquire(&task_home)
+            .map_err(|error| operation_error(&task_home, "获取跨进程操作锁", error))?;
+        provider_sync::recover_pending_state(&task_home)
+            .map_err(|error| operation_error(&task_home, "恢复上次未完成的操作", error))?;
+        delete_official_account_inner(&task_home, &account_id)
+            .map_err(|error| operation_error(&task_home, "删除官方账号", error))
+    })
+    .await
+    .map_err(|error| operation_error(&codex_home, "等待官方账号删除任务", error))?;
+    if result.is_ok() {
+        notify_providers_changed(&app);
+    }
+    result
 }
 
 async fn start_official_login_task(

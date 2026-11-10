@@ -60,6 +60,9 @@ fn text(v: Option<&Value>) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
 }
+// One document per account: a rename is the whole commit point, so cleanup is retryable.
+const DELETING_PREFIX: &str = ".deleting-";
+
 pub(crate) fn identity(auth: &[u8]) -> Option<Identity> {
     if oauth::inspect_auth(auth) == oauth::LocalAuthState::Invalid {
         return None;
@@ -113,7 +116,17 @@ impl Store {
         }
         let mut rows = Vec::new();
         for entry in fs::read_dir(&self.root)? {
-            let p = entry?.path();
+            let entry = entry?;
+            let p = entry.path();
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(DELETING_PREFIX)
+            {
+                // A delete committed by the rename but interrupted before cleanup.
+                let _ = fs::remove_file(&p);
+                continue;
+            }
             if p.extension().is_none_or(|x| x != "json") {
                 continue;
             }
@@ -185,6 +198,21 @@ impl Store {
         let mut row = self.save(auth)?;
         row.live_revision = Some(revision(auth));
         self.write(&row)
+    }
+    pub fn delete(&self, id: &str) -> Result<(), Box<dyn Error>> {
+        let path = self.path(id)?;
+        let tombstone = self.root.join(format!("{DELETING_PREFIX}{id}.json"));
+        if path.exists() {
+            fs::rename(&path, &tombstone)?;
+        }
+        match fs::remove_file(&tombstone) {
+            Ok(()) => Ok(()),
+            // The rename is the commit point; an interrupted cleanup is retried by list().
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(format!("删除官方账号快照失败 {}：{error}", tombstone.display()).into())
+            }
+        }
     }
 }
 
