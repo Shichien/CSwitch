@@ -392,7 +392,12 @@ main {
   opacity: 1;
 }
 
-.official-card .provider-select,
+.official-card .official-account-select {
+  grid-column: 1;
+  grid-template-columns: 28px minmax(0, 1fr);
+}
+
+.official-card .provider-select:not(.official-account-select),
 .account-status,
 .account-quota,
 .provider-usage-status {

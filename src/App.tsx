@@ -757,11 +757,11 @@ function App() {
         </div>
         <button className={`autostart-button${autostart ? " enabled" : ""}`}
           type="button" aria-pressed={autostart === true} aria-busy={autostartBusy}
-          title={autostart === null ? "点击重新读取开机自启动状态" : autostart ? "已开启，点击关闭" : "已关闭，点击开启"}
+          title={autostart === null ? "点击重新读取开机自启状态" : autostart ? "已开启，点击关闭" : "已关闭，点击开启"}
           disabled={locked || autostartBusy}
           onClick={() => void toggleAutostart()}>
           {autostartBusy ? <LoaderCircle className="spinner" size={14} /> : autostart === true ? <Check size={14} /> : null}
-          {autostart === null ? "自启动状态未知" : "开机自启动"}
+          {autostart === null ? "自启状态未知" : "开机自启"}
         </button>
         <div ref={addMenuRef} className="add-menu" onBlur={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget)) setAddMenuOpen(false);
@@ -794,7 +794,7 @@ function App() {
                   : "订阅信息暂不可用";
             return (
               <article key={account.id} className={`provider-card official-card${account.active ? " active" : ""}`}>
-                <button className="provider-select" type="button" disabled={locked}
+                <button className="provider-select official-account-select" type="button" disabled={locked}
                   onClick={() => void useOfficial(account, reauthRequired)}
                   aria-label={reauthRequired
                     ? `重新登录官方账号 ${account.label}`
@@ -807,7 +807,6 @@ function App() {
                     <span className="provider-meta"><span>{subscription}</span>
                     </span>
                   </span>
-                  {busy === "official" ? <LoaderCircle className="spinner" size={18} /> : <LogIn size={18} />}
                 </button>
                 <div className="provider-actions">
                   <button className="icon-button delete-button" type="button"
@@ -816,6 +815,14 @@ function App() {
                     disabled={locked || account.active}
                     onClick={() => setDeletingAccount(account)}>
                     <Trash2 size={16} />
+                  </button>
+                  <button className="icon-button" type="button" disabled={locked}
+                    onClick={() => void useOfficial(account, reauthRequired)}
+                    aria-label={reauthRequired
+                      ? `重新登录官方账号 ${account.label}`
+                      : `切换到官方账号 ${account.label}`}
+                    title={reauthRequired ? "重新登录" : "登录"}>
+                    {busy === "official" ? <LoaderCircle className="spinner" size={18} /> : <LogIn size={18} />}
                   </button>
                 </div>
                 <OfficialUsagePanel
