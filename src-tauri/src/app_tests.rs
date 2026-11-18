@@ -415,7 +415,7 @@ fn switching_providers_updates_auth_catalog_model_and_active_marker() {
     let first_document = parse_config(&first_config).expect("parse first config");
     assert_eq!(first_document["model"].as_str(), Some("official-model"));
     assert_eq!(first_document["approval_policy"].as_str(), Some("never"));
-    assert!(!first_document.contains_key("model_catalog_json"));
+    assert!(first_document.contains_key("model_catalog_json"));
     assert_eq!(
         api_key_from_auth(&fs::read(codex_home.join("auth.json")).unwrap())
             .unwrap()
@@ -439,15 +439,16 @@ fn switching_providers_updates_auth_catalog_model_and_active_marker() {
         second_document["model_providers"]["custom"]["name"].as_str(),
         Some("供应商二")
     );
-    assert!(!second_document.contains_key("model_catalog_json"));
+    assert!(second_document.contains_key("model_catalog_json"));
     assert!(delete_provider_inner(codex_home, &second.id).is_err());
-    delete_provider_inner(codex_home, &first.id).expect("delete inactive provider");
+    // Saved configuration backups retain references to the first catalog.
+    assert!(delete_provider_inner(codex_home, &first.id).is_err());
     assert_eq!(
         ProfileStore::new(codex_home)
             .list_providers()
             .unwrap()
             .len(),
-        1
+        2
     );
 
     let saved_official = ProfileStore::new(codex_home)
@@ -846,9 +847,13 @@ fn keep_official_auth_preserves_chatgpt_tokens_and_only_changes_route() {
     activate_provider_inner_with_close(codex_home, &second.id, || Ok(false))
         .expect("switch to second provider");
     assert_eq!(
-        fs::read_to_string(codex_home.join("config.toml")).unwrap(),
-        config,
-        "hot switching must retain the existing address and configuration bytes"
+        config::with_model_catalog(
+            &fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            None
+        )
+        .unwrap(),
+        config::with_model_catalog(&config, None).unwrap(),
+        "switching must retain settings other than the model catalog"
     );
     assert_eq!(
         fs::read(codex_home.join("auth.json")).unwrap(),
@@ -1055,6 +1060,7 @@ fn official_route_keeps_native_history_and_falls_back_to_http() {
         "upstream-fixture-key",
         &["model"],
     );
+    serve_fixture_catalog(root, &provider.id);
     let server = thread::spawn(move || {
         for expected in ["/responses", "/responses/compact"] {
             let (mut socket, _) = listener.accept().unwrap();
@@ -1543,4 +1549,98 @@ fn imports_named_provider_even_after_registry_exists() {
     assert_eq!(store.list_providers().unwrap().len(), 1);
     assert_eq!(fs::read(home.path().join("config.toml")).unwrap(), config);
     assert_eq!(fs::read(home.path().join("auth.json")).unwrap(), auth);
+}
+
+#[test]
+fn every_activation_fetches_models_and_keeps_previous_catalog_on_failure() {
+    use tiny_http::{Response, Server};
+    let dir = tempdir().unwrap();
+    let server = Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", server.server_addr());
+    let provider = save_fixture_provider(dir.path(), "refresh", &url, "fixture-key", &["old"]);
+    let task = std::thread::spawn(move || {
+        for body in [
+            Some(r#"{"data":[{"id":"first"}]}"#),
+            Some(r#"{"data":[{"id":"second"},{"id":"second"},{"id":"third"}]}"#),
+            None,
+        ] {
+            let request = server
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.url(), "/v1/models");
+            assert!(request.headers().iter().any(
+                |h| h.field.equiv("Authorization") && h.value.as_str() == "Bearer fixture-key"
+            ));
+            request
+                .respond(match body {
+                    Some(body) => Response::from_string(body),
+                    None => Response::from_string("unavailable").with_status_code(503),
+                })
+                .unwrap();
+        }
+    });
+    let mut previous = None;
+    for expected in [
+        vec!["first"],
+        vec!["second", "third"],
+        vec!["second", "third"],
+    ] {
+        let report =
+            activate_provider_inner_with_close(dir.path(), &provider.id, || Ok(false)).unwrap();
+        let config = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let doc = parse_config(&config).unwrap();
+        let path = doc["model_catalog_json"].as_str().unwrap();
+        assert_eq!(catalog_ids(&fs::read(path).unwrap()), expected);
+        if let Some(old) = previous.as_ref() {
+            assert!(std::path::Path::new(old).exists());
+        }
+        previous = Some(path.to_string());
+        if !report.warnings.is_empty() {
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("刷新模型列表失败"))
+            );
+        }
+    }
+    task.join().unwrap();
+}
+
+// A separate models endpoint lets inference fixtures retain their streaming schedules.
+fn serve_fixture_catalog(home: &Path, id: &str) {
+    use tiny_http::{Response, Server};
+    let store = ProfileStore::new(home);
+    let profile = store.load_provider(id).unwrap();
+    let ids = profile
+        .catalog
+        .as_deref()
+        .map(catalog_ids)
+        .unwrap_or_else(|| vec!["fixture".into()]);
+    let body = json!({"data": ids.into_iter().map(|id| json!({"id": id})).collect::<Vec<_>>()})
+        .to_string();
+    let server = Server::http("127.0.0.1:0").unwrap();
+    store
+        .save_provider_with_routing(
+            Some(id),
+            &profile.record.name,
+            &format!("http://{}", server.server_addr()),
+            &profile.auth,
+            profile.catalog.as_deref(),
+            &profile.record.protocol,
+            &profile.record.routing_mode,
+            profile.record.inference_endpoint.as_deref(),
+            &profile.config,
+        )
+        .unwrap();
+    std::thread::spawn(move || {
+        while let Some(request) = server
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+        {
+            assert_eq!(request.url(), "/v1/models");
+            request.respond(Response::from_string(&body)).unwrap();
+        }
+    });
 }

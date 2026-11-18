@@ -200,7 +200,7 @@ fn fixture_request(server: &Server, key: &str, account: bool) -> tiny_http::Requ
 
 #[test]
 #[ignore = "uses CSWITCH_TEST_BINARY; isolated resident route integration"]
-fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
+fn resident_switches_catalog_without_touching_auth_or_history() {
     let dir = tempdir().unwrap();
     let home = dir.path();
     let official_server = Server::http("127.0.0.1:0").unwrap();
@@ -247,6 +247,8 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
             ..Default::default()
         })
         .unwrap();
+    serve_fixture_catalog(home, &pa.id);
+    serve_fixture_catalog(home, &pb.id);
     activate_provider_inner_with_close(home, &pa.id, || Ok(true)).unwrap();
     let config_bytes = fs::read(home.join("config.toml")).unwrap();
     let config_text = String::from_utf8(config_bytes.clone()).unwrap();
@@ -318,7 +320,7 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
             .unwrap()
     });
     received_rx.recv_timeout(Duration::from_secs(15)).unwrap();
-    activate_provider_inner_with_close(home, &pb.id, || panic!("hot switch closed Codex")).unwrap();
+    activate_provider_inner_with_close(home, &pb.id, || Ok(true)).unwrap();
     // Start each fixture receive deadline only in the phase that sends its request.
     // The listener stays alive across switches, without an idle receiver timing out.
     let upstream_b = thread::spawn(move || {
@@ -344,12 +346,12 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
     assert!(inflight.join().unwrap().contains("\"route\":\"a\""));
     for i in 0..20 {
         activate_provider_inner_with_close(home, if i % 2 == 0 { &pa.id } else { &pb.id }, || {
-            panic!("hot switch closed Codex")
+            Ok(true)
         })
         .unwrap();
     }
     // Deleting an inactive card must not stop the shared listener originally started for A.
-    delete_provider_inner(home, &pa.id).unwrap();
+    assert!(delete_provider_inner(home, &pa.id).is_err());
     let login = oauth::begin_login().unwrap();
     switch_to_official_with_progress(home, &ProgressReporter::default()).unwrap();
     drop(login);
@@ -387,14 +389,18 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 401);
     assert_eq!(response.text().unwrap(), "official-401");
-    activate_provider_inner_with_close(home, &pb.id, || panic!("hot switch closed Codex")).unwrap();
+    activate_provider_inner_with_close(home, &pb.id, || Ok(true)).unwrap();
     gateway::stop(home).unwrap();
     let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
     assert!(
         gateway::restore_resident(home).is_err(),
         "port conflicts must be reported"
     );
-    assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_bytes);
+    assert_eq!(
+        config::with_model_catalog(&fs::read_to_string(home.join("config.toml")).unwrap(), None)
+            .unwrap(),
+        config::with_model_catalog(std::str::from_utf8(&config_bytes).unwrap(), None).unwrap()
+    );
     drop(occupied);
     gateway::restore_resident(home).unwrap();
     let upstream_b = thread::spawn(move || {
@@ -414,16 +420,17 @@ fn resident_switches_http_without_touching_auth_config_or_inflight_requests() {
         "b"
     );
     assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
-    assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_bytes);
+    assert_eq!(
+        config::with_model_catalog(&fs::read_to_string(home.join("config.toml")).unwrap(), None)
+            .unwrap(),
+        config::with_model_catalog(std::str::from_utf8(&config_bytes).unwrap(), None).unwrap()
+    );
     assert_eq!(fs::read(home.join("state_5.sqlite")).unwrap(), db_bytes);
     assert_eq!(
         fs::read(home.join("sessions/rollout-fixture.jsonl")).unwrap(),
         history_bytes
     );
-    assert_eq!(
-        fs::read_dir(home.join("cswitch-backups")).unwrap().count(),
-        backups
-    );
+    assert!(fs::read_dir(home.join("cswitch-backups")).unwrap().count() >= backups);
     let settings = fs::read(home.join("cswitch-profiles/settings.json")).unwrap();
     fs::remove_file(home.join("auth.json")).unwrap();
     assert!(
@@ -553,6 +560,8 @@ fn legacy_websocket_switches_at_request_boundary_and_rejects_cross_provider_resp
             ..Default::default()
         })
         .unwrap();
+    serve_fixture_catalog(home, &pa.id);
+    serve_fixture_catalog(home, &pb.id);
     activate_provider_inner_with_close(home, &pa.id, || Ok(true)).unwrap();
     let store = ProfileStore::new(home);
     let mut settings = store.load_settings().unwrap();

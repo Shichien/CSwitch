@@ -312,6 +312,7 @@ fn imported_fixed_provider_routes_with_official_auth_and_restores_original_field
     fs::write(home.path().join("auth.json"), &auth).unwrap();
     let state = list_provider_state(home.path()).unwrap();
     let id = state.providers[0].id.clone();
+    serve_fixture_catalog(home.path(), &id);
     activate_official_route_with_close(home.path(), &id, &ProgressReporter::default(), || {
         Ok(false)
     })

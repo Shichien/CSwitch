@@ -411,6 +411,37 @@ impl ProfileStore {
         Ok(())
     }
 
+    // Immutable files keep configuration backups valid across subsequent refreshes.
+    pub fn codex_catalog_path(&self, id: &str) -> Result<Option<PathBuf>, Box<dyn Error>> {
+        use sha2::{Digest, Sha256};
+        let profile = self.load_provider(id)?;
+        let Some(catalog) = profile.catalog else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value = serde_json::from_slice(&catalog)?;
+        let ids = payload["models"]
+            .as_array()
+            .ok_or("模型目录缺少 models")?
+            .iter()
+            .map(|m| {
+                m["slug"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or("模型目录缺少 slug")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let catalog = crate::model_catalog::build(ids)?;
+        let digest = format!("{:x}", Sha256::digest(&catalog.bytes));
+        let path = self
+            .record_dir(&profile.record)?
+            .join(format!("models-{digest}.json"));
+        if !path.exists() {
+            atomic_write_private(&path, &catalog.bytes)?;
+        }
+        verify_file(&path, &catalog.bytes)?;
+        Ok(Some(path))
+    }
+
     pub fn update_provider_catalog(
         &self,
         id: &str,

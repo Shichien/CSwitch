@@ -621,9 +621,26 @@ where
             .as_ref()
             .ok_or("供应商缺少已验证的推理接口，请重新保存供应商")?;
     }
+    let catalog_warnings = if id != "openai" {
+        progress.stage(
+            1,
+            2,
+            "刷新模型列表",
+            "正在使用供应商 URL 和 Key 获取模型列表。",
+        );
+        refresh_switch_catalog(&profiles, id)?
+    } else {
+        Vec::new()
+    };
+    let catalog_path = if id != "openai" {
+        profiles.codex_catalog_path(id)?
+    } else {
+        None
+    };
     let mut settings = profiles.load_settings()?;
     let original = read_optional_file(&codex_home.join("config.toml"))?;
     let text = std::str::from_utf8(original.as_deref().unwrap_or_default())?;
+    let catalog_changed = config::with_model_catalog(text, catalog_path.as_deref())? != text;
     let old_route = settings.official_route.clone();
     if let Some(route) = &old_route {
         verify_route_config(text, route)?;
@@ -666,7 +683,7 @@ where
     let migrate_history = needs_http_config
         && config_provider == "openai"
         && old_route.as_ref().is_some_and(|route| !route.native_openai);
-    if needs_http_config || live_auth.as_deref() != Some(auth.as_slice()) {
+    if needs_http_config || catalog_changed || live_auth.as_deref() != Some(auth.as_slice()) {
         close_codex()?;
     }
     let original = read_optional_file(&codex_home.join("config.toml"))?;
@@ -732,6 +749,7 @@ where
     } else {
         config::with_http_route(&direct_text, &config_provider, &base_url)?
     };
+    let updated = config::with_model_catalog(&updated, catalog_path.as_deref())?;
     settings.keep_official_auth = true;
     settings.official_route = Some(profiles::OfficialRoute {
         provider_id: id.into(),
@@ -748,7 +766,7 @@ where
         return Err("准备路由期间官方登录已退出，请重新登录".into());
     }
     oauth::ensure_login_active()?;
-    let mut report = if !needs_http_config {
+    let mut report = if !needs_http_config && !catalog_changed {
         if !live_auth.as_deref().is_some_and(is_official_credential) {
             return Err("切换期间官方登录已退出，已保留原线路，请重新登录".into());
         }
@@ -772,10 +790,11 @@ where
         )?
     };
     report.warnings.extend(prepared.commit());
-    if needs_http_config {
-        report.warnings.push(
-            "已启用本地路由，请重新打开 Codex；此后切换线路无需重启，CSwitch 需保持运行".into(),
-        );
+    report.warnings.extend(catalog_warnings);
+    if needs_http_config || catalog_changed {
+        report
+            .warnings
+            .push("本地路由或模型目录已更新，请重新打开 Codex；CSwitch 需保持运行".into());
     }
     progress.finish(2);
     Ok(report)
@@ -831,6 +850,22 @@ where
     let text = std::str::from_utf8(original.as_deref().unwrap_or_default())?;
     verify_route_config(text, &route)?;
     let updated = config::restore_route_config(text, &route)?;
+    let direct_catalog = if route.config_provider != "openai" {
+        let direct = profiles.load_provider(
+            route
+                .direct_provider_id
+                .as_deref()
+                .unwrap_or(&route.provider_id),
+        )?;
+        let doc = parse_config(std::str::from_utf8(&direct.config)?)?;
+        doc.get("cswitch_model_catalog")
+            .and_then(|marker| marker.get("managed"))
+            .and_then(toml_edit::Item::as_str)
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    };
+    let updated = config::with_model_catalog(&updated, direct_catalog.as_deref())?;
     settings.keep_official_auth = keep_preference;
     let auth_update = direct_auth
         .as_deref()
@@ -873,6 +908,25 @@ where
         return read_optional_file(&home.join("auth.json"));
     }
     Ok(live)
+}
+
+fn refresh_switch_catalog(
+    profiles: &ProfileStore,
+    id: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let target = profiles.load_provider(id)?;
+    let key = api_key_from_auth(&target.auth)?.ok_or("供应商缺少 API Key")?;
+    match model_catalog::fetch_with_auth(
+        &target.record.api_url,
+        &key,
+        target.record.protocol == "anthropic_messages",
+    ) {
+        Ok(catalog) => {
+            profiles.update_provider_catalog(id, &catalog.bytes)?;
+            Ok(Vec::new())
+        }
+        Err(error) => Ok(vec![format!("刷新模型列表失败，保留已有列表：{error}")]),
+    }
 }
 
 pub(crate) fn refresh_provider_models_inner(
@@ -950,6 +1004,7 @@ where
         "读取供应商",
         &format!("正在加载 {} 的配置和密钥。", target.record.name),
     );
+    let mut catalog_warnings = Vec::new();
     if target.catalog.is_none() || target.record.inference_endpoint.is_none() {
         progress.stage(
             2,
@@ -991,7 +1046,17 @@ where
             config.as_bytes(),
         )?;
         target = profiles.load_provider(&record.id)?;
+    } else {
+        progress.stage(
+            2,
+            TOTAL,
+            "刷新模型列表",
+            "正在使用供应商 URL 和 Key 获取模型列表。",
+        );
+        catalog_warnings = refresh_switch_catalog(&profiles, provider_id)?;
+        target = profiles.load_provider(provider_id)?;
     }
+    let catalog_path = profiles.codex_catalog_path(provider_id)?;
     if target.record.protocol != "openai_responses" && target.record.routing_mode != "local" {
         return Err(format!(
             "{} 需要先启用本地路由进行协议转换",
@@ -1064,6 +1129,7 @@ where
         } else {
             updated
         };
+        let updated = config::with_model_catalog(&updated, catalog_path.as_deref())?;
         verify_provider_content(
             updated.as_bytes(),
             &target.auth,
@@ -1095,6 +1161,7 @@ where
                 .warnings
                 .push(format!("切换已完成，旧路由清理失败：{error}"));
         }
+        report.warnings.extend(catalog_warnings);
         progress.stage(7, TOTAL, "完成", "供应商已切换。");
         Ok(report)
     })

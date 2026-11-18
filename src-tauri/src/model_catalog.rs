@@ -121,7 +121,20 @@ fn models_endpoint(api_url: &str) -> String {
 fn model_info(model: &str) -> Value {
     json!({
         "slug": model,
-        "display_name": model
+        "display_name": model,
+        "description": "Provider model",
+        "base_instructions": "",
+        "supported_reasoning_levels": [],
+        "shell_type": "default",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 0,
+        "support_verbosity": false,
+        "supports_reasoning_summary_parameter": false,
+        "default_reasoning_summary": "none",
+        "truncation_policy": { "mode": "bytes", "limit": 10000 },
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"]
     })
 }
 
@@ -159,19 +172,12 @@ mod tests {
             .map(|model| model["slug"].as_str().expect("slug"))
             .collect::<Vec<_>>();
         assert_eq!(ids, ["model-b", "model-a"]);
-        assert_eq!(
-            value["models"],
-            json!([
-                {
-                    "slug": "model-b",
-                    "display_name": "model-b"
-                },
-                {
-                    "slug": "model-a",
-                    "display_name": "model-a"
-                }
-            ])
-        );
+        for model in value["models"].as_array().unwrap() {
+            assert_eq!(model["visibility"], "list");
+            assert_eq!(model["supported_in_api"], true);
+            assert!(model.get("context_window").is_none());
+            assert_eq!(model["supported_reasoning_levels"], json!([]));
+        }
     }
 
     #[test]

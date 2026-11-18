@@ -540,8 +540,37 @@ pub(crate) fn build_custom_auth(api_key: &str) -> Result<Vec<u8>, Box<dyn Error>
     }))?)
 }
 
+// Record ownership explicitly so switching back never deletes a user-owned catalog.
+pub(crate) fn with_model_catalog(
+    content: &str,
+    path: Option<&std::path::Path>,
+) -> Result<String, Box<dyn Error>> {
+    let mut doc = parse_config(content)?;
+    if let Some(marker) = doc.remove("cswitch_model_catalog") {
+        let managed = marker.get("managed").and_then(Item::as_str);
+        if doc.get("model_catalog_json").and_then(Item::as_str) == managed {
+            if let Some(previous) = marker.get("previous").and_then(Item::as_str) {
+                doc["model_catalog_json"] = value(previous);
+            } else {
+                doc.remove("model_catalog_json");
+            }
+        }
+    }
+    if let Some(path) = path {
+        let path = path.to_str().ok_or("模型目录路径不是 UTF-8")?;
+        let mut marker = Table::new();
+        if let Some(previous) = doc.get("model_catalog_json").and_then(Item::as_str) {
+            marker["previous"] = value(previous);
+        }
+        marker["managed"] = value(path);
+        doc["model_catalog_json"] = value(path);
+        doc["cswitch_model_catalog"] = Item::Table(marker);
+    }
+    Ok(doc.to_string())
+}
+
 pub(crate) fn build_official_config(original: &str) -> Result<String, Box<dyn Error>> {
-    let mut document = parse_config(original)?;
+    let mut document = parse_config(&with_model_catalog(original, None)?)?;
     document.remove("model_provider");
     document.remove("experimental_bearer_token");
     if let Some(providers) = document
@@ -663,5 +692,33 @@ mod regression_tests {
             Some(9)
         );
         assert!(document["model_providers"].get("other").is_some());
+    }
+}
+
+#[cfg(test)]
+mod managed_catalog_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn restores_user_catalog_and_preserves_external_edits() {
+        let original = "model_catalog_json='/user/models.json'\nmodel='keep'\n";
+        let first = with_model_catalog(original, Some(Path::new("/managed/a.json"))).unwrap();
+        let second = with_model_catalog(&first, Some(Path::new("/managed/b.json"))).unwrap();
+        let restored = parse_config(&build_official_config(&second).unwrap()).unwrap();
+        assert_eq!(
+            restored["model_catalog_json"].as_str(),
+            Some("/user/models.json")
+        );
+        assert_eq!(restored["model"].as_str(), Some("keep"));
+        assert!(!restored.contains_key("cswitch_model_catalog"));
+        let mut external = parse_config(&second).unwrap();
+        external["model_catalog_json"] = value("/external/models.json");
+        let restored =
+            parse_config(&with_model_catalog(&external.to_string(), None).unwrap()).unwrap();
+        assert_eq!(
+            restored["model_catalog_json"].as_str(),
+            Some("/external/models.json")
+        );
     }
 }
