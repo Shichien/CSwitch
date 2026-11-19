@@ -1110,6 +1110,31 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn regenerates_legacy_text_only_catalog_without_changing_backup() {
+        let home = tempdir().unwrap();
+        let store = ProfileStore::new(home.path());
+        let legacy = br#"{"models":[{"slug":"vision-model","display_name":"vision-model","input_modalities":["text"]}]}"#;
+        let provider = store
+            .save_provider(
+                None,
+                "fixture",
+                "https://example.invalid/v1",
+                br#"{"OPENAI_API_KEY":"fixture"}"#,
+                Some(legacy),
+                b"model_provider='custom'\n",
+            )
+            .unwrap();
+        let path = store.codex_catalog_path(&provider.id).unwrap().unwrap();
+        let catalog: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "vision-model");
+        assert!(catalog["models"][0].get("input_modalities").is_none());
+        assert_eq!(
+            store.load_provider(&provider.id).unwrap().catalog.unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
     fn stores_official_pair_and_custom_config_separately() {
         let directory = tempdir().expect("tempdir");
         let store = ProfileStore::new(directory.path());

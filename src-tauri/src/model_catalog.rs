@@ -118,6 +118,9 @@ fn models_endpoint(api_url: &str) -> String {
     }
 }
 
+// Generic model IDs do not establish input capabilities. Leave input_modalities
+// unspecified so Codex uses its backward-compatible text + image default.
+// In particular, never synthesize a text-only restriction for every provider.
 fn model_info(model: &str) -> Value {
     json!({
         "slug": model,
@@ -133,8 +136,7 @@ fn model_info(model: &str) -> Value {
         "supports_reasoning_summary_parameter": false,
         "default_reasoning_summary": "none",
         "truncation_policy": { "mode": "bytes", "limit": 10000 },
-        "experimental_supported_tools": [],
-        "input_modalities": ["text"]
+        "experimental_supported_tools": []
     })
 }
 
@@ -173,6 +175,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, ["model-b", "model-a"]);
         for model in value["models"].as_array().unwrap() {
+            assert!(model.get("input_modalities").is_none());
             assert_eq!(model["visibility"], "list");
             assert_eq!(model["supported_in_api"], true);
             assert!(model.get("context_window").is_none());
