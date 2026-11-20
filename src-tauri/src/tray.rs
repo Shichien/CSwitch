@@ -137,11 +137,7 @@ fn build_menu(app: &AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn Error>> {
                     CheckMenuItem::with_id(
                         app,
                         format!("account:{}", a.id),
-                        format!(
-                            "{} · {}",
-                            a.label,
-                            a.workspace.chars().take(8).collect::<String>()
-                        ),
+                        &a.label,
                         true,
                         a.active,
                         None::<&str>,
@@ -162,6 +158,25 @@ fn build_menu(app: &AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn Error>> {
         entries.push(item);
     }
     entries.push(&bottom_sep);
+    let autostart = match crate::desktop::get_autostart(app) {
+        Ok(enabled) => {
+            let action = if enabled {
+                "disable_autostart"
+            } else {
+                "enable_autostart"
+            };
+            CheckMenuItem::with_id(app, action, "开机自启", true, enabled, None::<&str>)?.kind()
+        }
+        Err(_) => MenuItem::with_id(
+            app,
+            "refresh_autostart",
+            "开机自启（状态未知）",
+            true,
+            None::<&str>,
+        )?
+        .kind(),
+    };
+    entries.push(&autostart);
     entries.push(&quit);
     Ok(Menu::with_items(app, &entries)?)
 }

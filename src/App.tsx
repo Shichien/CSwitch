@@ -1,9 +1,15 @@
 import {
   AlertCircle,
   Check,
+  Crown,
+  Gem,
+  Route,
+  Sparkles,
+  BadgeCheck,
   CircleUserRound,
   LoaderCircle,
   LogIn,
+  ListPlus,
   Plus,
   KeyRound,
   RefreshCw,
@@ -83,17 +89,27 @@ function resetTimeLabel(resetAt: number | null): string | null {
   }).format(date)} 重置`;
 }
 
-function planLabel(plan: string | null): string | null {
-  if (!plan) return null;
-  const names: Record<string, string> = {
-    free: "Free",
-    plus: "Plus",
-    pro: "Pro",
-    team: "Team",
-    business: "Business",
-    enterprise: "Enterprise",
-  };
-  return names[plan.toLowerCase()] ?? plan;
+const plans: Record<string, { label: string; icon: typeof Gem }> = {
+  plus: { label: "Plus", icon: Sparkles },
+  pro: { label: "Pro", icon: Gem },
+  prolite: { label: "Pro Lite", icon: Gem },
+  promax: { label: "Pro Max", icon: Crown },
+  max: { label: "Max", icon: Crown },
+  free: { label: "Free", icon: BadgeCheck },
+  team: { label: "Team", icon: BadgeCheck },
+  business: { label: "Business", icon: BadgeCheck },
+  enterprise: { label: "Enterprise", icon: BadgeCheck },
+};
+
+function PlanBadge({ plan }: { plan: string }) {
+  const key = plan.toLowerCase().replace(/[\s_-]+/g, "");
+  const { label, icon: Icon } = plans[key] ?? { label: plan, icon: BadgeCheck };
+  return (
+    <span className="plan-badge" data-plan={key}>
+      <Icon size={12} aria-hidden="true" />
+      {label}
+    </span>
+  );
 }
 
 function OfficialUsagePanel({
@@ -152,19 +168,17 @@ function OfficialUsagePanel({
             const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
             const reset = resetTimeLabel(window.resetAt);
             return (
-              <div className="quota-window" key={`${window.name}-${window.windowSeconds ?? index}`}
-                title={window.resetAt ? new Date(window.resetAt * 1000).toLocaleString() : undefined}>
-                <div className="quota-line">
-                  <span>{window.name}</span>
-                  <strong className={remaining <= 10 ? "low" : remaining <= 30 ? "medium" : ""}>
-                    {Math.round(remaining)}%
-                  </strong>
-                </div>
+              <div className="quota-line" key={`${window.name}-${window.windowSeconds ?? index}`}
+                title={reset ?? undefined}>
+                <span className="quota-name">{window.name}</span>
                 <div className="quota-track" aria-hidden="true">
                   <span className={remaining <= 10 ? "low" : remaining <= 30 ? "medium" : ""}
                     style={{ width: `${remaining}%` }} />
                 </div>
-                {reset && <span className="quota-reset">{reset}</span>}
+                <strong className={remaining <= 10 ? "low" : remaining <= 30 ? "medium" : ""}>
+                  {Math.round(remaining)}%
+                </strong>
+                {reset && <span className="sr-only">{reset}</span>}
               </div>
             );
           })}
@@ -192,9 +206,6 @@ function App() {
   const [state, setState] = useState<ProviderState>(EMPTY_STATE);
   const [busy, setBusy] = useState<BusyAction>("load");
   const [notice, setNotice] = useState<Notice>(null);
-  const [autostart, setAutostart] = useState<boolean | null>(null);
-  const [autostartBusy, setAutostartBusy] = useState(false);
-  const autostartInFlight = useRef(false);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const addMenuRef = useRef<HTMLDivElement>(null);
   const [providerDialogOpen, setProviderDialogOpen] = useState(false);
@@ -228,37 +239,6 @@ function App() {
     setNotice({ kind, text });
     noticeTimer.current = window.setTimeout(() => setNotice(null), 3000);
   }, []);
-
-  useEffect(() => {
-    let disposed = false;
-    void cswitchApi.getAutostart().then((enabled) => {
-      if (!disposed) setAutostart(enabled);
-    }).catch((error) => {
-      if (!disposed) showNotice("error", errorText(error));
-    });
-    return () => { disposed = true; };
-  }, [showNotice]);
-
-  const toggleAutostart = async () => {
-    if (autostartInFlight.current) return;
-    autostartInFlight.current = true;
-    setAutostartBusy(true);
-    try {
-      if (autostart === null) {
-        setAutostart(await cswitchApi.getAutostart());
-        return;
-      }
-      const enabled = await cswitchApi.setAutostart(!autostart);
-      setAutostart(enabled);
-      showNotice("success", enabled ? "已开启开机自启动" : "已关闭开机自启动");
-    } catch (error) {
-      setAutostart(null);
-      showNotice("error", errorText(error));
-    } finally {
-      autostartInFlight.current = false;
-      setAutostartBusy(false);
-    }
-  };
 
   const reportSuccess = (name: string, report: ProviderSyncReport) => {
     const text = switchedNotice(name, Math.max(report.rolloutFilesUpdated, report.sqliteRowsUpdated));
@@ -753,23 +733,17 @@ function App() {
           >
             <span />
           </button>
-          <label id="resident-route-label" htmlFor="resident-route">路由模式</label>
+          <label id="resident-route-label" htmlFor="resident-route">
+            <Route size={18} strokeWidth={1.8} aria-hidden="true" />路由模式
+          </label>
         </div>
-        <button className={`autostart-button${autostart ? " enabled" : ""}`}
-          type="button" aria-pressed={autostart === true} aria-busy={autostartBusy}
-          title={autostart === null ? "点击重新读取开机自启状态" : autostart ? "已开启，点击关闭" : "已关闭，点击开启"}
-          disabled={locked || autostartBusy}
-          onClick={() => void toggleAutostart()}>
-          {autostartBusy ? <LoaderCircle className="spinner" size={14} /> : autostart === true ? <Check size={14} /> : null}
-          {autostart === null ? "自启状态未知" : "开机自启"}
-        </button>
         <div ref={addMenuRef} className="add-menu" onBlur={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget)) setAddMenuOpen(false);
         }}>
           <button className="add-button" type="button" aria-label="添加账号或供应商" title="添加"
             aria-expanded={addMenuOpen} aria-controls="add-options" disabled={locked}
             onClick={() => setAddMenuOpen((open) => !open)}>
-            <Plus size={19} />
+            <ListPlus size={21} strokeWidth={1.85} aria-hidden="true" />
           </button>
           {addMenuOpen && (
             <div id="add-options" className="add-menu-options" role="group" aria-label="添加类型">
@@ -786,7 +760,7 @@ function App() {
             const usage = officialUsage[account.id];
             const reauthRequired = usage?.data?.health === "reauth_required";
             const subscription = usage?.data?.health === "valid"
-              ? (planLabel(usage.data.plan) ?? "订阅信息未返回")
+              ? (usage.data.plan ? <PlanBadge plan={usage.data.plan} /> : "订阅信息未返回")
               : usage?.checking
                 ? "正在查询订阅"
                 : reauthRequired
@@ -804,8 +778,7 @@ function App() {
                     <span className="provider-title-row"><strong title={account.label}>{account.label}</strong>
                       {account.active && <span className="active-badge"><Check size={12} />当前</span>}
                     </span>
-                    <span className="provider-meta"><span>{subscription}</span>
-                    </span>
+                    <span className="provider-meta">{subscription}</span>
                   </span>
                 </button>
                 <div className="provider-actions">

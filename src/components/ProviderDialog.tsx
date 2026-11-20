@@ -1,4 +1,4 @@
-import { Eye, EyeOff, X } from "lucide-react";
+import { Eye, EyeOff, Globe2, KeyRound, Tag, X } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import type { ProviderDraft, ProviderSummary } from "../types";
 
@@ -56,33 +56,40 @@ export function ProviderDialog({
           </button>
         </div>
 
-        <label htmlFor="provider-name">供应商名称</label>
-        <input
-          id="provider-name"
-          autoFocus
-          maxLength={80}
-          autoComplete="organization"
-          placeholder="例如：小猪窝"
-          required
-          disabled={busy}
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-        />
+        <label htmlFor="provider-name">名称</label>
+        <div className="provider-field">
+          <Tag size={16} aria-hidden="true" />
+          <input
+            id="provider-name"
+            autoFocus
+            maxLength={80}
+            autoComplete="organization"
+            placeholder="例如：小猪窝"
+            required
+            disabled={busy}
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </div>
 
         <label htmlFor="api-url">API URL</label>
-        <input
-          id="api-url"
-          inputMode="url"
-          autoComplete="url"
-          placeholder="https://api.example.com"
-          required
-          disabled={busy}
-          value={apiUrl}
-          onChange={(event) => setApiUrl(event.target.value)}
-        />
+        <div className="provider-field">
+          <Globe2 size={16} aria-hidden="true" />
+          <input
+            id="api-url"
+            inputMode="url"
+            autoComplete="url"
+            placeholder="https://api.example.com"
+            required
+            disabled={busy}
+            value={apiUrl}
+            onChange={(event) => setApiUrl(event.target.value)}
+          />
+        </div>
 
         <label htmlFor="api-key">API Key</label>
-        <div className="secret-field">
+        <div className="provider-field">
+          <KeyRound size={16} aria-hidden="true" />
           <input
             id="api-key"
             type={showKey ? "text" : "password"}

@@ -32,8 +32,6 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
         }))
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
-            get_autostart,
-            set_autostart,
             list_providers,
             query_official_account_usage,
             query_provider_usage,
@@ -70,6 +68,18 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
 pub(crate) fn handle_tray_menu(app: &AppHandle, id: &str) {
     match id {
         "show" => tray::show_main_window(app),
+        "enable_autostart" | "disable_autostart" | "refresh_autostart" => {
+            let result = if id == "refresh_autostart" {
+                get_autostart(app).map(|_| ())
+            } else {
+                set_autostart(app, id == "enable_autostart")
+            };
+            tray::refresh(app);
+            if let Err(error) = result {
+                tray::show_main_window(app);
+                report_tray_error(app, &error);
+            }
+        }
         "quit" => tray::request_exit(app),
         "official" => {
             tray::show_main_window(app);
@@ -108,15 +118,13 @@ pub(crate) fn handle_tray_menu(app: &AppHandle, id: &str) {
     }
 }
 
-#[tauri::command]
-fn get_autostart(app: AppHandle) -> Result<bool, String> {
+pub(crate) fn get_autostart(app: &AppHandle) -> Result<bool, String> {
     app.autolaunch()
         .is_enabled()
         .map_err(|error| format!("读取开机自启动状态失败：{error}"))
 }
 
-#[tauri::command]
-fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+fn set_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let manager = app.autolaunch();
     if enabled {
         manager.enable()
@@ -124,9 +132,10 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
         manager.disable()
     }
     .map_err(|error| format!("设置开机自启动失败：{error}"))?;
-    manager
-        .is_enabled()
-        .map_err(|error| format!("确认开机自启动状态失败：{error}"))
+    if get_autostart(app)? != enabled {
+        return Err("系统未更新开机自启设置".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
