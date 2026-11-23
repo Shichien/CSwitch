@@ -3,6 +3,7 @@ use std::error::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 
+pub(crate) const LEGACY_RESPONSE_STORAGE: &str = "disable_response_storage";
 const CUSTOM_PROVIDER_ID: &str = "custom";
 const OFFICIAL_PROVIDER_ID: &str = "openai";
 pub(crate) const HTTP_ROUTE_PROVIDER_ID: &str = "cswitch_local";
@@ -540,31 +541,65 @@ pub(crate) fn build_custom_auth(api_key: &str) -> Result<Vec<u8>, Box<dyn Error>
     }))?)
 }
 
-// Record ownership explicitly so switching back never deletes a user-owned catalog.
+// Store ownership in a comment alongside the catalog path. Codex ignores TOML comments.
+const CATALOG_COMMENT: &str = "# CSwitch catalog: ";
+
+type CatalogState = (String, Option<String>);
+
+pub(crate) fn catalog_state(doc: &DocumentMut) -> Result<Option<CatalogState>, Box<dyn Error>> {
+    if let Some(marker) = doc.get("cswitch_model_catalog")
+        && let Some(path) = marker.get("managed").and_then(Item::as_str)
+    {
+        let previous = marker
+            .get("previous")
+            .and_then(Item::as_str)
+            .map(str::to_owned);
+        return Ok(Some((path.to_owned(), previous)));
+    }
+    let state = doc
+        .get("model_catalog_json")
+        .and_then(Item::as_value)
+        .and_then(|v| v.decor().suffix())
+        .and_then(|s| s.as_str())
+        .and_then(|s| s.trim().strip_prefix(CATALOG_COMMENT));
+    Ok(state.map(serde_json::from_str).transpose()?)
+}
+
 pub(crate) fn with_model_catalog(
     content: &str,
     path: Option<&std::path::Path>,
 ) -> Result<String, Box<dyn Error>> {
     let mut doc = parse_config(content)?;
-    if let Some(marker) = doc.remove("cswitch_model_catalog") {
-        let managed = marker.get("managed").and_then(Item::as_str);
-        if doc.get("model_catalog_json").and_then(Item::as_str) == managed {
-            if let Some(previous) = marker.get("previous").and_then(Item::as_str) {
+    doc.remove(LEGACY_RESPONSE_STORAGE);
+    let state = catalog_state(&doc)?;
+    doc.remove("cswitch_model_catalog");
+    if let Some((managed, previous)) = state {
+        if doc.get("model_catalog_json").and_then(Item::as_str) == Some(managed.as_str()) {
+            if let Some(previous) = previous {
                 doc["model_catalog_json"] = value(previous);
             } else {
                 doc.remove("model_catalog_json");
             }
+        } else if let Some(v) = doc
+            .get_mut("model_catalog_json")
+            .and_then(Item::as_value_mut)
+            && v.decor()
+                .suffix()
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| s.trim().starts_with(CATALOG_COMMENT))
+        {
+            v.decor_mut().set_suffix("");
         }
     }
     if let Some(path) = path {
         let path = path.to_str().ok_or("模型目录路径不是 UTF-8")?;
-        let mut marker = Table::new();
-        if let Some(previous) = doc.get("model_catalog_json").and_then(Item::as_str) {
-            marker["previous"] = value(previous);
-        }
-        marker["managed"] = value(path);
-        doc["model_catalog_json"] = value(path);
-        doc["cswitch_model_catalog"] = Item::Table(marker);
+        let previous = doc.get("model_catalog_json").and_then(Item::as_str);
+        let state = serde_json::to_string(&(path, previous))?;
+        let mut catalog = toml_edit::Value::from(path);
+        catalog
+            .decor_mut()
+            .set_suffix(format!(" {CATALOG_COMMENT}{state}"));
+        doc["model_catalog_json"] = Item::Value(catalog);
     }
     Ok(doc.to_string())
 }
@@ -704,6 +739,12 @@ mod managed_catalog_tests {
     fn restores_user_catalog_and_preserves_external_edits() {
         let original = "model_catalog_json='/user/models.json'\nmodel='keep'\n";
         let first = with_model_catalog(original, Some(Path::new("/managed/a.json"))).unwrap();
+        assert!(!first.contains("cswitch_model_catalog"));
+        let legacy = "model_catalog_json='/managed/a.json'\nmodel='keep'\n[cswitch_model_catalog]\nmanaged='/managed/a.json'\nprevious='/user/models.json'\n";
+        assert_eq!(
+            with_model_catalog(legacy, Some(Path::new("/managed/a.json"))).unwrap(),
+            first
+        );
         let second = with_model_catalog(&first, Some(Path::new("/managed/b.json"))).unwrap();
         let restored = parse_config(&build_official_config(&second).unwrap()).unwrap();
         assert_eq!(

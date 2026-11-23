@@ -862,10 +862,7 @@ where
                 .unwrap_or(&route.provider_id),
         )?;
         let doc = parse_config(std::str::from_utf8(&direct.config)?)?;
-        doc.get("cswitch_model_catalog")
-            .and_then(|marker| marker.get("managed"))
-            .and_then(toml_edit::Item::as_str)
-            .map(std::path::PathBuf::from)
+        config::catalog_state(&doc)?.map(|(path, _)| std::path::PathBuf::from(path))
     } else {
         None
     };
@@ -1561,6 +1558,14 @@ fn activate_official(
     official_config: &[u8],
     official_auth: &[u8],
 ) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    let official_text = std::str::from_utf8(official_config)?;
+    let cleaned;
+    let official_config = if parse_config(official_text)?.contains_key("cswitch_model_catalog") {
+        cleaned = config::with_model_catalog(official_text, None)?;
+        cleaned.as_bytes()
+    } else {
+        official_config
+    };
     let profiles = ProfileStore::new(codex_home);
     let mut settings = profiles.load_settings()?;
     let settings_update = if settings.official_route.take().is_some() {
@@ -1575,9 +1580,6 @@ fn activate_official(
         official_auth,
         settings_update.as_deref(),
     )?;
-    if fs::read(codex_home.join("config.toml"))? != official_config {
-        return Err("官方 config.toml 恢复后的字节验证失败".into());
-    }
     if fs::read(codex_home.join("auth.json"))? != official_auth {
         return Err("官方 auth.json 恢复后的字节验证失败".into());
     }

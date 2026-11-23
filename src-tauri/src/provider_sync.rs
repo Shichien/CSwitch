@@ -374,6 +374,21 @@ where
     if live_config.as_deref() != original_config {
         return Err("config.toml 在读取后发生变化，请重新切换".into());
     }
+    // Saved profiles and account-only switches can supply an unmodified old config.
+    let text = std::str::from_utf8(updated_config)?;
+    let mut document = text
+        .trim_start_matches('\u{feff}')
+        .parse::<toml_edit::DocumentMut>()?;
+    let cleaned;
+    let updated_config = if document
+        .remove(crate::config::LEGACY_RESPONSE_STORAGE)
+        .is_some()
+    {
+        cleaned = document.to_string();
+        cleaned.as_bytes()
+    } else {
+        updated_config
+    };
     let config_unchanged = original_config.is_some_and(|content| content == updated_config);
     let auth_unchanged = match auth_update {
         AuthUpdate::Keep => true,

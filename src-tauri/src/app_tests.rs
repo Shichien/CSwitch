@@ -707,6 +707,17 @@ fn a_new_provider_requires_an_api_key_before_network_checks() {
 }
 
 #[test]
+fn official_activation_cleans_legacy_storage_setting_from_saved_config() {
+    let home = tempfile::tempdir().unwrap();
+    let saved = b"disable_response_storage = false\nmodel = 'keep'\n";
+    activate_official(home.path(), None, saved, b"{}").unwrap();
+    assert_eq!(
+        fs::read(home.path().join("config.toml")).unwrap(),
+        b"model = 'keep'\n"
+    );
+}
+
+#[test]
 fn official_config_preserves_a_user_catalog_pointer() {
     let original = "model_provider = \"custom\"\nmodel_catalog_json = \"/tmp/models.json\"\nmodel = \"test\"\n";
     let updated = build_official_config(original).expect("build official config");
