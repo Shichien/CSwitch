@@ -430,7 +430,18 @@ impl ProfileStore {
                     .ok_or("模型目录缺少 slug")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let catalog = crate::model_catalog::build(ids)?;
+        let home = self.root.parent().ok_or("供应商目录缺少父目录")?;
+        let cache = read_optional(&home.join("models_cache.json"))?
+            .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+            .transpose()?;
+        let known_models = match &cache {
+            Some(cache) => cache["models"]
+                .as_array()
+                .ok_or("Codex 模型缓存缺少 models 数组")?
+                .as_slice(),
+            None => &[],
+        };
+        let catalog = crate::model_catalog::build_with_reasoning(ids, known_models)?;
         let digest = format!("{:x}", Sha256::digest(&catalog.bytes));
         let path = self
             .record_dir(&profile.record)?
@@ -1108,6 +1119,69 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>>
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn generated_catalog_preserves_cached_reasoning_for_exact_model_ids() {
+        let home = tempdir().unwrap();
+        let store = ProfileStore::new(home.path());
+        let original =
+            crate::model_catalog::build(["known-model".into(), "known-model-alias".into()])
+                .unwrap();
+        let provider = store
+            .save_provider(
+                None,
+                "fixture",
+                "https://example.invalid/v1",
+                br#"{"OPENAI_API_KEY":"fixture"}"#,
+                Some(&original.bytes),
+                b"",
+            )
+            .unwrap();
+        let old_path = store.codex_catalog_path(&provider.id).unwrap().unwrap();
+        let old_bytes = fs::read(&old_path).unwrap();
+        let known = serde_json::json!({
+            "slug": "known-model",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [
+                {"effort":"high", "description":"High"},
+                {"effort":"xhigh", "description":"Extra high"}
+            ],
+            "supports_reasoning_summary_parameter": true,
+            "default_reasoning_summary": "auto",
+            "supports_reasoning_effort_updates": true
+        });
+        fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&serde_json::json!({"models": [known.clone()]})).unwrap(),
+        )
+        .unwrap();
+        let path = store.codex_catalog_path(&provider.id).unwrap().unwrap();
+        let catalog: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for field in [
+            "default_reasoning_level",
+            "supported_reasoning_levels",
+            "supports_reasoning_summary_parameter",
+            "default_reasoning_summary",
+            "supports_reasoning_effort_updates",
+        ] {
+            assert_eq!(catalog["models"][0][field], known[field]);
+        }
+        assert_eq!(
+            catalog["models"][1]["supported_reasoning_levels"],
+            serde_json::json!([])
+        );
+        assert!(
+            catalog["models"][1]
+                .get("default_reasoning_level")
+                .is_none()
+        );
+        assert_ne!(path, old_path);
+        assert_eq!(fs::read(old_path).unwrap(), old_bytes);
+        assert_eq!(
+            store.load_provider(&provider.id).unwrap().catalog.unwrap(),
+            original.bytes
+        );
+    }
 
     #[test]
     fn regenerates_legacy_text_only_catalog_without_changing_backup() {

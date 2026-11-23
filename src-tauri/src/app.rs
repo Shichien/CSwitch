@@ -683,7 +683,7 @@ where
     let migrate_history = needs_http_config
         && config_provider == "openai"
         && old_route.as_ref().is_some_and(|route| !route.native_openai);
-    if needs_http_config || catalog_changed || live_auth.as_deref() != Some(auth.as_slice()) {
+    if needs_http_config || live_auth.as_deref() != Some(auth.as_slice()) {
         close_codex()?;
     }
     let original = read_optional_file(&codex_home.join("config.toml"))?;
@@ -791,10 +791,14 @@ where
     };
     report.warnings.extend(prepared.commit());
     report.warnings.extend(catalog_warnings);
-    if needs_http_config || catalog_changed {
+    if needs_http_config {
         report
             .warnings
             .push("本地路由或模型目录已更新，请重新打开 Codex；CSwitch 需保持运行".into());
+    } else if catalog_changed {
+        report
+            .warnings
+            .push("线路已切换，Codex 保持运行；如需刷新模型选择列表，请自行重新打开 Codex".into());
     }
     progress.finish(2);
     Ok(report)

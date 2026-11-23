@@ -641,7 +641,7 @@ function App() {
       showNotice(
         "success",
         enabled
-          ? "路由模式已开启；首次启用或模型目录变化后，请重新打开 Codex"
+          ? "路由模式已开启；首次启用后请重新打开 Codex，后续切换线路保持运行"
           : "路由模式已关闭，请重新打开 Codex 使用原请求地址",
       );
     } catch (error) {

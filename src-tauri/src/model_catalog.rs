@@ -88,6 +88,16 @@ pub fn build<I>(model_ids: I) -> Result<ModelCatalog, Box<dyn Error>>
 where
     I: IntoIterator<Item = String>,
 {
+    build_with_reasoning(model_ids, &[])
+}
+
+pub fn build_with_reasoning<I>(
+    model_ids: I,
+    known_models: &[Value],
+) -> Result<ModelCatalog, Box<dyn Error>>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut seen = HashSet::new();
     let model_ids = model_ids
         .into_iter()
@@ -101,7 +111,25 @@ where
 
     let models = model_ids
         .iter()
-        .map(|model| model_info(model))
+        .map(|model| {
+            let mut info = model_info(model);
+            // Generic /models responses contain IDs, not capability declarations.
+            // Preserve Codex's known reasoning metadata only for exact model IDs.
+            if let Some(known) = known_models.iter().find(|known| known["slug"] == *model) {
+                for field in [
+                    "supported_reasoning_levels",
+                    "default_reasoning_level",
+                    "supports_reasoning_summary_parameter",
+                    "default_reasoning_summary",
+                    "supports_reasoning_effort_updates",
+                ] {
+                    if let Some(value) = known.get(field) {
+                        info[field] = value.clone();
+                    }
+                }
+            }
+            info
+        })
         .collect::<Vec<_>>();
     Ok(ModelCatalog {
         bytes: serde_json::to_vec_pretty(&json!({ "models": models }))?,

@@ -320,7 +320,21 @@ fn resident_switches_catalog_without_touching_auth_or_history() {
             .unwrap()
     });
     received_rx.recv_timeout(Duration::from_secs(15)).unwrap();
-    activate_provider_inner_with_close(home, &pb.id, || Ok(true)).unwrap();
+    let report = activate_provider_inner_with_close(home, &pb.id, || {
+        panic!("catalog changes must not close Codex during a resident switch")
+    })
+    .unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Codex 保持运行"))
+    );
+    assert!(
+        fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .contains("model_reasoning_effort='high'")
+    );
     // Start each fixture receive deadline only in the phase that sends its request.
     // The listener stays alive across switches, without an idle receiver timing out.
     let upstream_b = thread::spawn(move || {
@@ -346,7 +360,7 @@ fn resident_switches_catalog_without_touching_auth_or_history() {
     assert!(inflight.join().unwrap().contains("\"route\":\"a\""));
     for i in 0..20 {
         activate_provider_inner_with_close(home, if i % 2 == 0 { &pa.id } else { &pb.id }, || {
-            Ok(true)
+            panic!("resident switches must keep Codex running")
         })
         .unwrap();
     }
