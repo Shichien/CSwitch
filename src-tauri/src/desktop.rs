@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, PhysicalPosition};
+
+#[path = "window_geometry.rs"]
+mod window_geometry;
+#[path = "window_state.rs"]
+mod window_state;
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::app::{
@@ -27,11 +32,13 @@ pub(crate) fn operation_in_progress() -> bool {
 
 pub(crate) fn run() -> Result<(), Box<dyn Error>> {
     tauri::Builder::default()
+        .manage(window_state::WindowState::default())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             tray::show_main_window(app)
         }))
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
+            fit_initial_window,
             list_providers,
             query_official_account_usage,
             query_provider_usage,
@@ -48,10 +55,23 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
             cancel_official_login
         ])
         .setup(|app| {
+            // Monitor discovery can fail (for example on a headless session). Keep
+            // the configured defaults rather than preventing the app from opening.
+            if let Err(error) = window_state::initialize(app.handle()) {
+                eprintln!("Could not initialize main window geometry: {error}");
+            }
             tray::setup(app.handle()).map_err(|error| error.to_string())?;
             Ok(())
         })
         .on_window_event(|window, event| {
+            window_state::event(window, event);
+            if matches!(event, tauri::WindowEvent::Resized(_)) {
+                // Frontend content can grow the initially centered window. Only
+                // move it when needed to keep that new size in the work area.
+                if let Err(error) = keep_main_window_in_work_area(window) {
+                    eprintln!("Could not constrain main window position: {error}");
+                }
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if tray::allow_exit() {
                     return;
@@ -61,7 +81,46 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())?;
+        .build(tauri::generate_context!())?
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                window_state::flush(app);
+            }
+        });
+    Ok(())
+}
+
+#[tauri::command]
+fn fit_initial_window(app: AppHandle, height: f64) -> Result<(), String> {
+    window_state::fit(&app, height)
+}
+
+fn keep_main_window_in_work_area(window: &tauri::Window) -> tauri::Result<()> {
+    if window.label() != "main"
+        || window.is_maximized()?
+        || window.is_fullscreen()?
+        || window.is_minimized()?
+    {
+        return Ok(());
+    }
+    let Some(monitor) = window.current_monitor()? else {
+        return Ok(());
+    };
+    let work_area = monitor.work_area();
+    let position = window.outer_position()?;
+    let size = window.outer_size()?;
+    let [x, y] = window_geometry::constrain_position(
+        [position.x, position.y],
+        [size.width, size.height],
+        [work_area.position.x, work_area.position.y],
+        [work_area.size.width, work_area.size.height],
+    );
+    if x != position.x || y != position.y {
+        window.set_position(PhysicalPosition::new(x, y))?;
+    }
     Ok(())
 }
 

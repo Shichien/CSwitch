@@ -21,6 +21,8 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import { ProviderCard, type ProviderUsageView } from "./components/ProviderCard";
 import { ProviderDialog } from "./components/ProviderDialog";
 import { cswitchApi } from "./lib/api";
+import { mergeOfficialUsage, mergeProviderUsage, resetTimeLabel, updatedLabel, type UsageView } from "./lib/usage";
+import { useNow } from "./lib/useNow";
 import type {
   OfficialAccountSummary,
   OfficialAccountUsage,
@@ -45,7 +47,7 @@ const EMPTY_STATE: ProviderState = {
 
 type Notice = { kind: "success" | "error"; text: string } | null;
 type BusyAction = "load" | "official" | "save" | "route" | "delete" | "keep-auth" | string | null;
-type OfficialUsageView = { checking: boolean; data: OfficialAccountUsage | null };
+type OfficialUsageView = UsageView<OfficialAccountUsage>;
 
 function unavailableUsage(accountId: string, message: string): OfficialAccountUsage {
   return {
@@ -73,20 +75,6 @@ function unavailableProviderUsage(providerId: string, message: string): Provider
     message,
     queriedAt: Date.now(),
   };
-}
-
-function resetTimeLabel(resetAt: number | null): string | null {
-  if (!resetAt) return null;
-  const date = new Date(resetAt * 1000);
-  if (Number.isNaN(date.getTime())) return null;
-  return `${new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(date)} 重置`;
 }
 
 const plans: Record<string, { label: string; icon: typeof Gem }> = {
@@ -125,6 +113,7 @@ function OfficialUsagePanel({
   onRefresh: () => void;
   onReauth: () => void;
 }) {
+  const now = useNow();
   if (!usage || (usage.checking && !usage.data)) {
     return (
       <div className="account-status checking" aria-live="polite">
@@ -166,11 +155,13 @@ function OfficialUsagePanel({
         <div className="quota-windows">
           {data.windows.map((window, index) => {
             const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
-            const reset = resetTimeLabel(window.resetAt);
+            const reset = resetTimeLabel(window.resetAt, now);
             return (
               <div className="quota-line" key={`${window.name}-${window.windowSeconds ?? index}`}
-                title={reset ?? undefined}>
-                <span className="quota-name">{window.name}</span>
+                title={[remaining <= 10 ? "额度不足" : remaining <= 30 ? "额度偏低" : null, reset].filter(Boolean).join(" · ") || undefined}>
+                <span className="quota-name">{window.name}{remaining <= 30 && (
+                    <AlertCircle size={12} role="img" aria-label={remaining <= 10 ? "额度不足" : "额度偏低"} />
+                  )}</span>
                 <div className="quota-track" aria-hidden="true">
                   <span className={remaining <= 10 ? "low" : remaining <= 30 ? "medium" : ""}
                     style={{ width: `${remaining}%` }} />
@@ -186,6 +177,10 @@ function OfficialUsagePanel({
       ) : (
         <span className="quota-empty">官方接口未返回限额窗口</span>
       )}
+      <span className={`quota-update${usage.refreshError ? " stale" : ""}`} title={usage.refreshError ?? undefined} role={usage.refreshError ? "status" : undefined}>
+        {usage.refreshError ? "更新失败 · " : usage.checking ? "正在更新 · " : ""}{updatedLabel(data.queriedAt, now)}
+        {usage.refreshError && " · 显示上次额度"}
+      </span>
       {data.message && <span className="quota-message">{data.message}</span>}
     </div>
   );
@@ -220,6 +215,7 @@ function App() {
   const [providerUsageEpoch, setProviderUsageEpoch] = useState(0);
   const noticeTimer = useRef<number | null>(null);
   const shellRef = useRef<HTMLDivElement>(null);
+  const initialWindowFitted = useRef(false);
   const officialCancelled = useRef(false);
   const inFlight = useRef(false);
   const usageGeneration = useRef(0);
@@ -254,20 +250,17 @@ function App() {
     usageRequestVersions.current[accountId] = requestVersion;
     setOfficialUsage((current) => ({
       ...current,
-      [accountId]: { checking: true, data: current[accountId]?.data ?? null },
+      [accountId]: { ...current[accountId], checking: true, data: current[accountId]?.data ?? null },
     }));
     try {
       const data = await cswitchApi.queryOfficialAccountUsage(accountId);
       if (usageRequestVersions.current[accountId] !== requestVersion) return;
-      setOfficialUsage((current) => ({ ...current, [accountId]: { checking: false, data } }));
+      setOfficialUsage((current) => ({ ...current, [accountId]: mergeOfficialUsage(current[accountId], data) }));
     } catch (error) {
       if (usageRequestVersions.current[accountId] !== requestVersion) return;
       setOfficialUsage((current) => ({
         ...current,
-        [accountId]: {
-          checking: false,
-          data: unavailableUsage(accountId, errorText(error)),
-        },
+        [accountId]: mergeOfficialUsage(current[accountId], unavailableUsage(accountId, errorText(error))),
       }));
     }
   }, []);
@@ -277,23 +270,20 @@ function App() {
     providerUsageRequestVersions.current[providerId] = requestVersion;
     setProviderUsage((current) => ({
       ...current,
-      [providerId]: { checking: true, data: current[providerId]?.data ?? null },
+      [providerId]: { ...current[providerId], checking: true, data: current[providerId]?.data ?? null },
     }));
     try {
       const data = await cswitchApi.queryProviderUsage(providerId);
       if (providerUsageRequestVersions.current[providerId] !== requestVersion) return;
       setProviderUsage((current) => ({
         ...current,
-        [providerId]: { checking: false, data },
+        [providerId]: mergeProviderUsage(current[providerId], data),
       }));
     } catch (error) {
       if (providerUsageRequestVersions.current[providerId] !== requestVersion) return;
       setProviderUsage((current) => ({
         ...current,
-        [providerId]: {
-          checking: false,
-          data: unavailableProviderUsage(providerId, errorText(error)),
-        },
+        [providerId]: mergeProviderUsage(current[providerId], unavailableProviderUsage(providerId, errorText(error))),
       }));
     }
   }, []);
@@ -496,6 +486,14 @@ function App() {
     });
     try {
       const result: SavedProvider = await cswitchApi.saveProvider(editingProvider?.id ?? null, draft);
+      // A changed endpoint or key may represent a different balance/account.
+      const id = result.provider.id;
+      providerUsageRequestVersions.current[id] = (providerUsageRequestVersions.current[id] ?? 0) + 1;
+      setProviderUsage((current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
       setProviderDialogOpen(false);
       setEditingProvider(null);
       await refresh();
@@ -685,24 +683,21 @@ function App() {
   }, [addMenuOpen]);
 
   useEffect(() => {
-    if (isLoading) return;
+    if (isLoading || hasDialog || initialWindowFitted.current) return;
+    // Fit once after the initial queries settle; subsequent refreshes never resize.
+    if (state.officialAccounts.some(({ id }) => !officialUsage[id] || officialUsage[id].checking)
+      || state.providers.some(({ id, hasApiKey }) => hasApiKey && (!providerUsage[id] || providerUsage[id].checking))) return;
     const frame = window.requestAnimationFrame(() => {
       const shell = shellRef.current;
       if (!shell) return;
       const header = shell.querySelector<HTMLElement>(".topbar");
       const main = shell.querySelector<HTMLElement>("main");
-      let height = (header?.offsetHeight ?? 0) + (main?.offsetHeight ?? 0);
-      for (const panel of shell.querySelectorAll<HTMLElement>(".dialog-panel, .progress-card")) {
-        height = Math.max(height, panel.scrollHeight + 42);
-      }
-      const limit = Math.max(220, Math.min(600, window.screen.availHeight - 80));
-      height = Math.max(220, Math.min(limit, Math.ceil(height)));
-      if (Math.abs(window.innerHeight - height) > 1) {
-        void cswitchApi.resizeWindow(height).catch((error) => showNotice("error", errorText(error)));
-      }
+      const height = Math.ceil((header?.offsetHeight ?? 0) + (main?.offsetHeight ?? 0));
+      initialWindowFitted.current = true;
+      void cswitchApi.fitInitialWindow(height).catch((error) => showNotice("error", errorText(error)));
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [isLoading, state.providers.length, state.officialAccounts.length, officialUsage, providerUsage, hasDialog, showNotice]);
+  }, [isLoading, state.providers, state.officialAccounts, officialUsage, providerUsage, hasDialog, showNotice]);
 
   const percent = progress && progress.total > 0
     ? Math.min(100, Math.round((progress.current / progress.total) * 100))

@@ -9,6 +9,8 @@ import {
   Trash2,
 } from "lucide-react";
 import type { ProviderSummary, ProviderUsage } from "../types";
+import { updatedLabel, type UsageView } from "../lib/usage";
+import { useNow } from "../lib/useNow";
 
 interface ProviderCardProps {
   provider: ProviderSummary;
@@ -23,10 +25,7 @@ interface ProviderCardProps {
   onEnableRouting: () => void;
 }
 
-export interface ProviderUsageView {
-  checking: boolean;
-  data: ProviderUsage | null;
-}
+export type ProviderUsageView = UsageView<ProviderUsage>;
 
 function amount(value: number, unit: string | null): string {
   const digits = Math.abs(value) >= 1000 ? 0 : 2;
@@ -67,6 +66,7 @@ function ProviderUsagePanel({
   disabled: boolean;
   onRefresh: () => void;
 }) {
+  const now = useNow();
   if (!provider.hasApiKey) return null;
   if (!usage || (usage.checking && !usage.data)) {
     return (
@@ -100,7 +100,19 @@ function ProviderUsagePanel({
     );
   }
 
-  return null;
+  return (
+    <div className={`provider-usage-status usage-updated${usage.refreshError ? " stale" : ""}`} title={usage.refreshError ?? undefined}>
+      {usage.refreshError && <AlertCircle size={14} aria-hidden="true" />}
+      <span role={usage.refreshError ? "status" : undefined}>
+        {usage.refreshError ? "更新失败 · " : usage.checking ? "正在更新 · " : ""}{updatedLabel(data.queriedAt, now)}
+        {usage.refreshError && " · 显示上次余额"}
+      </span>
+      <button className="quota-refresh" type="button" disabled={disabled || usage.checking}
+        aria-label={`刷新 ${provider.name} 的余额`} onClick={onRefresh}>
+        <RefreshCw className={usage.checking ? "spinner" : ""} size={13} />
+      </button>
+    </div>
+  );
 }
 
 export function ProviderCard({

@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import type {
   OfficialAccountUsage,
   ProviderUsage,
@@ -12,7 +11,7 @@ import type {
 } from "../types";
 
 export const cswitchApi = {
-  resizeWindow: (height: number) => getCurrentWindow().setSize(new LogicalSize(window.innerWidth, height)),
+  fitInitialWindow: (height: number) => invoke<void>("fit_initial_window", { height }),
   listProviders: () => invoke<ProviderState>("list_providers"),
   queryOfficialAccountUsage: (accountId: string) =>
     invoke<OfficialAccountUsage>("query_official_account_usage", { accountId }),

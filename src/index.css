@@ -508,19 +508,51 @@ main {
 
 .quota-windows {
   display: grid;
-  gap: 5px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 14px;
+}
+
+.quota-line:last-child:nth-child(odd) {
+  grid-column: 1 / -1;
 }
 
 .quota-line {
   display: grid;
-  grid-template-columns: minmax(4em, max-content) minmax(0, 1fr) 4ch;
+  min-width: 0;
+  grid-template-columns: max-content minmax(0, 1fr) 4ch;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-size: 12px;
 }
 
 .quota-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   color: var(--text-muted);
+}
+
+.quota-name svg {
+  flex-shrink: 0;
+  color: var(--orange);
+}
+
+.quota-update {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.provider-usage-status.usage-updated {
+  border-color: transparent;
+  background: transparent;
+  padding-block: 0;
+  margin-bottom: 5px;
+  font-size: 10px;
+}
+
+.quota-update.stale,
+.provider-usage-status.stale {
+  color: var(--amber);
 }
 
 .quota-line strong {
